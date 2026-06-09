@@ -70,7 +70,7 @@ def load_processed_files():
     
     data = {}
     for key, filename in files.items():
-        data[key] = pd.read_csv(f'processed_files/{filename}', sep='|', engine="pyarrow", dtype_backend="pyarrow")
+        data[key] = pd.read_csv(f'src/processed_files/{filename}', sep='|', engine="pyarrow", dtype_backend="pyarrow")
         
     return data
 

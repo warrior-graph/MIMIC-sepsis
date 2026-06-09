@@ -85,7 +85,15 @@ order by stay_id, starttime, itemid
  # I am not very sure if the equivalence conversion is correct. should confirm with domain expert.
 """
 
+# Wrap the query in a COPY TO STDOUT command, formatting it as a pipe-separated CSV
+copy_sql = f"COPY ({query}) TO STDOUT WITH CSV HEADER DELIMITER '|';"
 
+output_file = os.path.join(exportdir, 'fluid.csv')
 
-d = pd.read_sql_query(query,conn)
-d.to_csv(os.path.join(exportdir,'fluid.csv'),index=False,sep='|')
+# Open the file and stream the data directly into it
+with open(output_file, 'w') as f:
+    cursor = conn.cursor()
+    cursor.copy_expert(copy_sql, f)
+    cursor.close()
+
+conn.close()

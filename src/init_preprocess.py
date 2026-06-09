@@ -5,8 +5,6 @@ import pandas as pd
 from scipy.spatial.distance import cdist
 from scipy.interpolate import interp1d
 from scipy import stats
-from fancyimpute import KNN
-from utils import deloutabove, deloutbelow, SAH, fixgaps
 
 def parse_args():
     parser = argparse.ArgumentParser()

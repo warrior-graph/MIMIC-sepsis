@@ -154,19 +154,15 @@ order by stay_id, charttime
  227013 | GCS
 """
 
-# Note: The original code likely used chunks to handle memory constraints or timeout issues
-# If you encounter memory issues with this single query approach, we may need to revert to chunking
-try:
-    ce_data = pd.read_sql_query(query, conn)
-    print("Saving combined chartevents data...")
-    ce_data.to_csv(os.path.join(exportdir, 'chartevents.csv'), index=False, sep='|')
-    print("Completed processing chartevents data")
-except Exception as e:
-    print("Error: The single query approach failed. You may need to use chunking if:")
-    print("1. The database connection times out")
-    print("2. The query result exceeds available memory")
-    print("3. The database has query size limitations")
-    print(f"Error details: {str(e)}")
+# Wrap the query in a COPY TO STDOUT command, formatting it as a pipe-separated CSV
+copy_sql = f"COPY ({query}) TO STDOUT WITH CSV HEADER DELIMITER '|';"
 
+output_file = os.path.join(exportdir, 'chartevents.csv')
 
+# Open the file and stream the data directly into it
+with open(output_file, 'w') as f:
+    cursor = conn.cursor()
+    cursor.copy_expert(copy_sql, f)
+    cursor.close()
 
+conn.close()

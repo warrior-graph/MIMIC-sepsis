@@ -470,6 +470,15 @@ ORDER BY subject_id ASC, intime ASC
 """
 
 
+# Wrap the query in a COPY TO STDOUT command, formatting it as a pipe-separated CSV
+copy_sql = f"COPY ({query}) TO STDOUT WITH CSV HEADER DELIMITER '|';"
 
-d = pd.read_sql_query(query,conn)
-d.to_csv(os.path.join(exportdir,'demog.csv'),index=False,sep='|')
+output_file = os.path.join(exportdir, 'demog.csv')
+
+# Open the file and stream the data directly into it
+with open(output_file, 'w') as f:
+    cursor = conn.cursor()
+    cursor.copy_expert(copy_sql, f)
+    cursor.close()
+
+conn.close()
