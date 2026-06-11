@@ -89,6 +89,7 @@ class XGBoostModel:
             colsample_bytree=colsample_bytree,
             random_state=random_state,
             n_jobs=n_jobs,
+            device="cuda",
             **kwargs,
         )
 
