@@ -39,18 +39,28 @@ def load_data(data_path: str) -> pd.DataFrame:
 
 def get_feature_columns(df: pd.DataFrame, target_col: str) -> list:
     """Get feature columns by excluding specific columns"""
+    # Always-excluded columns (identifiers, future leakage)
     exclude_columns = [
-        'morta_hosp',  # future information, exclude to avoid data leakage
-        'morta_90',    # future information, exclude to avoid data leakage
-        'timestep',   # temporal index
-        'stay_id',    # identifier
-        target_col,   # target variable
-        'los',      # future information, exclude to avoid data leakage
-        'mechvent' if target_col != 'mechvent' else None,
+        'morta_hosp',  # future information — exclude to avoid data leakage
+        'morta_90',    # future information — exclude to avoid data leakage
+        'timestep',    # temporal index
+        'stay_id',     # identifier
+        target_col,    # target variable itself
+        'los',         # future information — exclude to avoid data leakage
+        # Exclude other target-like columns unless we are predicting them
+        'mechvent'     if target_col != 'mechvent'     else None,
         'septic_shock' if target_col != 'septic_shock' else None,
-        'vasopressor' if target_col != 'vasopressor' else None,
-        'vaso_median' if target_col != 'vasopressor' else None,
-        'vaso_max' if target_col != 'vasopressor' else None,
+        'vasopressor'  if target_col != 'vasopressor'  else None,
+        'vaso_median'  if target_col != 'vasopressor'  else None,
+        'vaso_max'     if target_col != 'vasopressor'  else None,
+        # Exclude score columns from features when predicting a different score
+        # (avoid trivial cross-prediction leakage)
+        'sofa_score'   if target_col != 'sofa_score'   else None,
+        'sirs_score'   if target_col != 'sirs_score'   else None,
+        'news2_score'  if target_col != 'news2_score'  else None,
+        # Also exclude SOFA sub-scores — they are derived from features already present
+        'sofa_resp', 'sofa_coag', 'sofa_liver', 'sofa_cv', 'sofa_cns', 'sofa_renal',
+        'sepsis',  # flag computed post-hoc
     ]
     return [col for col in df.columns if col not in exclude_columns]
 
@@ -141,29 +151,38 @@ def print_results(model_metrics: Dict[str, Dict[str, float]], baseline_metrics: 
         print(f"Val RMSE: {baseline_metrics['val']['rmse']:.3f}")
         print(f"Val MAE: {baseline_metrics['val']['mae']:.3f}")
 
-def run_benchmark(task: str, model_type: str, include_treatments: bool = True, 
+def run_benchmark(task: str, model_type: str, include_treatments: bool = True,
                  prediction_horizon: int = None, random_state: int = 42,
-                 regularization: str = 'ridge', alpha: float = 1.0):
+                 regularization: str = 'ridge', alpha: float = 1.0,
+                 balance: bool = False, balance_strategy: str = 'undersample',
+                 data_path: str = "processed_files/patient_timeseries_v4.csv"):
     # Determine task type based on target column
-    task_type = 'classification' if task in ['mechvent', 'morta_hosp', 'septic_shock', 'sepsis', 'vasopressor'] else 'regression'
-    
+    SCORE_TASKS = ['sofa_score', 'sirs_score', 'news2_score']
+    TEMPORAL_TASKS = ['mechvent', 'septic_shock', 'sepsis', 'vasopressor'] + SCORE_TASKS
+    task_type = 'regression' if task in ['los'] + SCORE_TASKS else 'classification'
+
     # Load and prepare data
-    df = load_data("processed_files/patient_timeseries_v4.csv")
+    df = load_data(data_path)
     features = get_feature_columns(df, task)
-    
+
     # Filter out treatment variables if specified
     if not include_treatments:
         treatment_vars = ['mechvent', 'vaso_median', 'vaso_max', 'abx_given',
-       'hours_since_first_abx', 'num_abx', 'fluid_total', 'fluid_step', 'peep', 'tidal_volume', 'minute_volume', 'peak_inspiratory_pressure', 'mean_airway_pressure']
+                          'hours_since_first_abx', 'num_abx', 'fluid_total', 'fluid_step',
+                          'peep', 'tidal_volume', 'minute_volume',
+                          'peak_inspiratory_pressure', 'mean_airway_pressure']
         features = [f for f in features if f not in treatment_vars]
-    
+
     # Initialize processor
     print("\nInitializing data processor...")
     processor = TimeSeriesDataProcessor(
         features=features,
         task=task,
         window_size=6,
-        prediction_horizon=prediction_horizon if task in ['septic_shock', 'mechvent', 'sepsis', 'vasopressor'] else None
+        prediction_horizon=prediction_horizon if task in TEMPORAL_TASKS else None,
+        balance=balance,
+        balance_strategy=balance_strategy,
+        random_state=random_state,
     )
 
     
@@ -257,11 +276,14 @@ def run_all_experiments():
     """Run experiments with different configurations and save results to CSV"""
     # Define tasks and their types
     tasks = {
-        'morta_hosp': 'static',  # Static outcome
-        'los': 'static',         # Static outcome
+        'morta_hosp': 'static',      # Static outcome
+        'los': 'static',             # Static outcome
         'septic_shock': 'temporal',  # Time-varying outcome
-        #'mechvent': 'temporal',       # Time-varying outcome
-        'vasopressor': 'temporal'       # Time-varying outcome
+        'vasopressor': 'temporal',   # Time-varying outcome
+        # Score regression tasks
+        'sofa_score': 'temporal',
+        'sirs_score': 'temporal',
+        'news2_score': 'temporal',
     }
     
     model_types = ['linear', 'lstm', 'transformer']
@@ -330,14 +352,17 @@ def run_all_experiments():
     
     return results
 
-def run_selected_experiments(task: str, include_treatments: bool = False):
+def run_selected_experiments(task: str, include_treatments: bool = False,
+                             balance: bool = False,
+                             balance_strategy: str = 'undersample'):
     """Run experiments with all models for a specific task and treatment setting"""
     model_types = ['linear', 'lstm', 'transformer']
-    
+
     # Determine if this is a temporal task
-    temporal_tasks = ['septic_shock', 'mechvent', 'sepsis', 'vasopressor']
+    temporal_tasks = ['septic_shock', 'mechvent', 'sepsis', 'vasopressor',
+                      'sofa_score', 'sirs_score', 'news2_score']
     is_temporal = task in temporal_tasks
-    
+
     # Define prediction horizons for temporal tasks
     prediction_horizons = [1, 2, 3, 4, 5, 6] if is_temporal else [None]
     
@@ -374,40 +399,54 @@ def run_selected_experiments(task: str, include_treatments: bool = False):
 if __name__ == "__main__":
     # Set random seeds at the beginning
     set_random_seeds()
-    
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--random_state", type=int, default=42, help="Random seed")
     parser.add_argument("--run_all", action="store_true", help="Run all experiments")
     parser.add_argument("--run_selected", action="store_true", help="Run all models for a specific task")
     parser.add_argument("--task", type=str, default="mechvent", help="Target column name")
     parser.add_argument("--model_type", type=str, default="lstm", help="Model type")
-    parser.add_argument("--include_treatments", type=bool, default=False, help="Whether to include treatment variables")
-    parser.add_argument("--prediction_horizon", type=int, default=6, help="Prediction horizon for temporal tasks (hours)")
-    parser.add_argument("--regularization", type=str, default="ridge", choices=["ridge", "lasso", "elasticnet", "none"], 
+    parser.add_argument("--include_treatments", type=bool, default=False,
+                        help="Whether to include treatment variables")
+    parser.add_argument("--prediction_horizon", type=int, default=6,
+                        help="Prediction horizon for temporal tasks (hours)")
+    parser.add_argument("--regularization", type=str, default="ridge",
+                        choices=["ridge", "lasso", "elasticnet", "none"],
                         help="Regularization type for linear models")
     parser.add_argument("--alpha", type=float, default=1.0, help="Regularization strength")
-    
+    parser.add_argument("--balance", action="store_true", default=False,
+                        help="Apply class / strata balancing to extracted windows before training")
+    parser.add_argument("--balance_strategy", type=str, default="undersample",
+                        choices=["undersample", "oversample", "combined"],
+                        help="Balancing strategy (default: undersample)")
+    parser.add_argument("--data_path", type=str,
+                        default="processed_files/patient_timeseries_v4.csv",
+                        help="Path to patient timeseries CSV (use _balanced.csv for pre-balanced data)")
+
     args = parser.parse_args()
 
     # Call this function at the beginning of your main function or script
     set_random_seeds(args.random_state)
-        
+
+    TEMPORAL_TASKS = ['septic_shock', 'mechvent', 'sepsis', 'vasopressor',
+                      'sofa_score', 'sirs_score', 'news2_score']
+
     if args.run_all:
         run_all_experiments()
     elif args.run_selected:
         run_selected_experiments(args.task, args.include_treatments)
     else:
-        # For single runs, use the specified prediction horizon for temporal tasks
-        temporal_tasks = ['septic_shock', 'mechvent', 'sepsis', 'vasopressor']
-        
         result = run_benchmark(
-            args.task, 
+            args.task,
             args.model_type,
             args.include_treatments,
-            prediction_horizon=args.prediction_horizon if args.task in temporal_tasks else None,
+            prediction_horizon=args.prediction_horizon if args.task in TEMPORAL_TASKS else None,
             random_state=args.random_state,
             regularization=args.regularization,
-            alpha=args.alpha
+            alpha=args.alpha,
+            balance=args.balance,
+            balance_strategy=args.balance_strategy,
+            data_path=args.data_path,
         )
         # Save single result to CSV
         pd.DataFrame([result]).to_csv("single_benchmark_result.csv", index=False)

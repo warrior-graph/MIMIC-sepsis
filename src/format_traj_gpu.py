@@ -56,6 +56,10 @@ def parse_args():
                         help="Use GPU acceleration if available")
     parser.add_argument("--gpu_device", type=int, default=0,
                         help="GPU device ID to use (default: 0)")
+    parser.add_argument("--balance", action='store_true', default=False,
+                        help="If specified, also write a class-balanced version of the output CSV")
+    parser.add_argument("--noise_ratio", type=float, default=0.10,
+                        help="Fraction of non-scoring patients to inject as noise relative to primary cohort (default: 0.10)")
     return parser.parse_args()
 
 
@@ -770,12 +774,30 @@ def handle_missing_values(df, missing_threshold=0.8):
         print(f"{var:<30} {miss_pct:>10.1%}")
     print("-" * 50)
 
+    # Score-critical columns that must never be dropped regardless of missingness
+    PROTECTED_SCORE_COLS = {
+        # SOFA
+        'arterial_o2_pressure', 'fio2', 'mechvent', 'platelets',
+        'bilirubin_total', 'map', 'gcs', 'creatinine',
+        # SIRS
+        'temp_C', 'temp_F', 'heart_rate', 'respiratory_rate',
+        'arterial_co2_pressure', 'wbc',
+        # NEWS2 extras
+        'spo2', 'oxygen_flow', 'oxygen_flow_device', 'sbp_arterial', 'richmond_ras',
+    }
+
     miss = df[measurement_cols].isna().sum() / len(df)
 
-    # Drop high-missing columns
-    cols_to_keep = miss[miss < missing_threshold].index.tolist()
+    # Drop high-missing columns — but NEVER drop score-critical columns
+    cols_to_keep = [
+        col for col in miss.index
+        if miss[col] < missing_threshold or col in PROTECTED_SCORE_COLS
+    ]
     non_meas_cols = [c for c in df.columns if c not in measurement_cols]
     df = df[non_meas_cols + cols_to_keep]
+
+    protected_kept = [c for c in PROTECTED_SCORE_COLS if c in df.columns]
+    print(f"Protected score columns retained: {len(protected_kept)} -> {protected_kept}")
 
     # Linear interpolation for low-missing columns
     low_missing_cols = miss[(miss > 0) & (miss < 0.05)].index
@@ -783,7 +805,7 @@ def handle_missing_values(df, missing_threshold=0.8):
     for col in low_missing_cols:
         df[col] = fixgaps(df[col].values)
 
-    # KNN imputation for remaining missing values
+    # KNN imputation for remaining missing values (includes protected cols above threshold)
     cols_for_knn = [c for c in cols_to_keep if c not in low_missing_cols and c in df.columns]
     if cols_for_knn:
         ref = df[cols_for_knn].values.astype(np.float64)
@@ -971,16 +993,93 @@ def calculate_derived_variables(df):
 
     df['sirs_score'] = backend.to_cpu(sirs).astype(int)
 
+    # ------------------------------------------------------------------ #
+    # NEWS2 Score (National Early Warning Score 2) — CPU path             #
+    # Uses Scale 1 SpO2 (standard; not hypercapnic respiratory failure)   #
+    # ------------------------------------------------------------------ #
+    news2 = np.zeros(len(df), dtype=int)
+
+    # Respiratory rate
+    if 'respiratory_rate' in df.columns:
+        rr_n = df['respiratory_rate'].values
+        valid = ~np.isnan(rr_n)
+        news2[valid & (rr_n <= 8)] += 3
+        news2[valid & (rr_n >= 9) & (rr_n <= 11)] += 1
+        news2[valid & (rr_n >= 21) & (rr_n <= 24)] += 2
+        news2[valid & (rr_n >= 25)] += 3
+
+    # SpO2 (Scale 1)
+    if 'spo2' in df.columns:
+        sp = df['spo2'].values
+        valid = ~np.isnan(sp)
+        news2[valid & (sp <= 91)] += 3
+        news2[valid & (sp >= 92) & (sp <= 93)] += 2
+        news2[valid & (sp >= 94) & (sp <= 95)] += 1
+
+    # Supplemental oxygen: fio2 > 21% → +2
+    if 'fio2' in df.columns:
+        fio2_n = df['fio2'].values
+        valid = ~np.isnan(fio2_n)
+        news2[valid & (fio2_n > 21)] += 2
+
+    # Systolic BP
+    if 'sbp_arterial' in df.columns:
+        sbp = df['sbp_arterial'].values
+        valid = ~np.isnan(sbp)
+        news2[valid & (sbp <= 90)] += 3
+        news2[valid & (sbp >= 91) & (sbp <= 100)] += 2
+        news2[valid & (sbp >= 101) & (sbp <= 110)] += 1
+        news2[valid & (sbp >= 220)] += 3
+
+    # Heart rate
+    if 'heart_rate' in df.columns:
+        hr_n = df['heart_rate'].values
+        valid = ~np.isnan(hr_n)
+        news2[valid & (hr_n <= 40)] += 3
+        news2[valid & (hr_n >= 41) & (hr_n <= 50)] += 1
+        news2[valid & (hr_n >= 91) & (hr_n <= 110)] += 1
+        news2[valid & (hr_n >= 111) & (hr_n <= 130)] += 2
+        news2[valid & (hr_n >= 131)] += 3
+
+    # Consciousness: GCS 15 = Alert (0), GCS < 15 = CVPU (+3)
+    if 'gcs' in df.columns:
+        gcs_n = df['gcs'].values
+        valid = ~np.isnan(gcs_n)
+        news2[valid & (gcs_n < 15)] += 3
+
+    # Temperature (Celsius)
+    if 'temp_C' in df.columns:
+        tc_n = df['temp_C'].values
+        valid = ~np.isnan(tc_n)
+        news2[valid & (tc_n <= 35.0)] += 3
+        news2[valid & (tc_n >= 35.1) & (tc_n <= 36.0)] += 1
+        news2[valid & (tc_n >= 38.1) & (tc_n <= 39.0)] += 1
+        news2[valid & (tc_n >= 39.1)] += 2
+
+    df['news2_score'] = news2
+
     # Print distributions
     for comp in ['sofa_resp', 'sofa_coag', 'sofa_liver', 'sofa_cv', 'sofa_cns', 'sofa_renal']:
         print(f"\n{comp} distribution:")
         print(df[comp].value_counts().sort_index())
 
+    print(f"\nnews2_score distribution:")
+    print(pd.Series(news2).value_counts().sort_index())
+
     return df
 
 
-def apply_exclusion_criteria(df):
-    """Apply exclusion criteria - vectorized, identical results"""
+def apply_exclusion_criteria(df, noise_ratio=0.10):
+    """Apply exclusion criteria with multi-score gate and controlled noise injection.
+
+    Patients are retained if they reach a clinical threshold on AT LEAST ONE of:
+      - SOFA >= 2  (organ dysfunction / Sepsis-3)
+      - SIRS >= 2  (systemic inflammation)
+      - NEWS2 >= 5 (medium clinical risk)
+
+    A controlled fraction (noise_ratio) of non-scoring patients is then
+    re-injected as negative examples to improve model robustness.
+    """
     print('Applying exclusion criteria')
 
     initial_patients = df['stay_id'].nunique()
@@ -1006,19 +1105,54 @@ def apply_exclusion_criteria(df):
     df = df[~df['stay_id'].isin(early_death_stays)]
     excluded_counts['early_death'] = len(early_death_stays)
 
-    max_sofa = df.groupby('stay_id')['sofa_score'].max()
-    non_sepsis_stays = max_sofa[max_sofa < 2].index.values
-    df = df[~df['stay_id'].isin(non_sepsis_stays)]
-    excluded_counts['non_sepsis'] = len(non_sepsis_stays)
+    # Multi-score gate: keep patients that score on at least one system
+    score_cols = {}
+    if 'sofa_score' in df.columns:
+        score_cols['max_sofa'] = ('sofa_score', 'max')
+    if 'sirs_score' in df.columns:
+        score_cols['max_sirs'] = ('sirs_score', 'max')
+    if 'news2_score' in df.columns:
+        score_cols['max_news2'] = ('news2_score', 'max')
+
+    if score_cols:
+        max_scores = df.groupby('stay_id').agg(**score_cols)
+
+        eligible_mask = pd.Series(False, index=max_scores.index)
+        if 'max_sofa' in max_scores.columns:
+            eligible_mask |= (max_scores['max_sofa'] >= 2)
+        if 'max_sirs' in max_scores.columns:
+            eligible_mask |= (max_scores['max_sirs'] >= 2)
+        if 'max_news2' in max_scores.columns:
+            eligible_mask |= (max_scores['max_news2'] >= 5)
+
+        eligible_stays   = max_scores[eligible_mask].index.values
+        ineligible_stays = max_scores[~eligible_mask].index.values
+
+        # Inject a controlled fraction of zero-score patients as noise
+        noise_n = max(1, int(len(eligible_stays) * noise_ratio))
+        rng = np.random.default_rng(42)
+        noise_stays = rng.choice(
+            ineligible_stays,
+            size=min(noise_n, len(ineligible_stays)),
+            replace=False
+        ) if len(ineligible_stays) > 0 else np.array([], dtype=ineligible_stays.dtype)
+
+        keep_stays = np.concatenate([eligible_stays, noise_stays])
+        df = df[df['stay_id'].isin(keep_stays)]
+
+        excluded_counts['no_score_threshold'] = len(ineligible_stays) - len(noise_stays)
+        excluded_counts['noise_injected']      = len(noise_stays)
+    else:
+        print("WARNING: No score columns found — skipping multi-score gate")
 
     final_patients = df['stay_id'].nunique()
     print("\nExclusion Statistics:")
     print("-" * 50)
     print(f"Initial patient count: {initial_patients}")
     for reason, count in excluded_counts.items():
-        print(f"Excluded due to {reason}: {count}")
+        print(f"  {reason}: {count}")
     print(f"Final patient count: {final_patients}")
-    print(f"Total excluded: {initial_patients - final_patients}")
+    print(f"Total excluded (net): {initial_patients - final_patients}")
     print("-" * 50)
 
     return df
@@ -1178,7 +1312,7 @@ def main():
     print(f"FiO2 zeros after handling missing values: {(init_traj['fio2'] == 0).sum()}" if 'fio2' in init_traj.columns else "")
 
     init_traj = calculate_derived_variables(init_traj)
-    init_traj = apply_exclusion_criteria(init_traj)
+    init_traj = apply_exclusion_criteria(init_traj, noise_ratio=args.noise_ratio)
     init_traj = add_septic_shock_flag(init_traj)
     init_traj = add_sepsis_flag(init_traj)
 
@@ -1189,10 +1323,21 @@ def main():
         if pct > 0:
             print(f"{col}: {pct:.1f}%")
 
-    # Save
-    output_path = f"{args.output_dir}/patient_timeseries_v4.csv"
+    # Save standard output — filename includes timestamp for versioning
+    from datetime import datetime
+    current_time = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+    init_traj = init_traj.sort_values(by=['stay_id', 'timestamp']).reset_index(drop=True)
+    output_path = f"{args.output_dir}/patient_timeseries_{current_time}.csv"
     init_traj.to_csv(output_path, index=False)
     print(f"Saved processed data to {output_path}")
+
+    # Optionally write a balanced version
+    if args.balance:
+        from data_processor import balance_dataframe
+        balanced = balance_dataframe(init_traj, score_cols=['sofa_score', 'sirs_score', 'news2_score'])
+        balanced_path = f"{args.output_dir}/patient_timeseries_{current_time}_balanced.csv"
+        balanced.to_csv(balanced_path, index=False)
+        print(f"Saved balanced data to {balanced_path}")
 
 
 if __name__ == "__main__":
