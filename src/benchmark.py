@@ -1,13 +1,16 @@
 import argparse
 import pandas as pd
 import numpy as np
+from datetime import datetime
 from data_processor import TimeSeriesDataProcessor
 from linear_model import LinearTimeSeriesModel
 from lstm_model import LSTMModel
 from transformer_model import TimeSeriesTransformer
 from xgboost_model import XGBoostModel, LightGBMModel
+from prophet_model import ProphetScoreModel
+from tft_model import TFTScoreModel
 from sklearn.metrics import roc_auc_score, average_precision_score, mean_squared_error, mean_absolute_error
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 import matplotlib.pyplot as plt
 import seaborn as sns
 import os
@@ -86,6 +89,58 @@ def split_data(df: pd.DataFrame, train_ratio: float = 0.8) -> Tuple[pd.DataFrame
     
     return train_df, val_df
 
+def evaluate_model_multistep(
+    targets: np.ndarray,
+    preds: np.ndarray,
+) -> Dict[str, float]:
+    """Compute per-step and aggregate metrics for multi-step regression.
+
+    Parameters
+    ----------
+    targets : np.ndarray, shape (N, H)
+    preds   : np.ndarray, shape (N, H)
+
+    Returns
+    -------
+    dict with keys: mean_rmse, mean_mae, rmse_step_1..H, mae_step_1..H
+    """
+    # Remove rows where either target or pred contains NaN
+    valid_mask = ~(np.isnan(targets).any(axis=1) | np.isnan(preds).any(axis=1))
+    targets = targets[valid_mask]
+    preds = preds[valid_mask]
+
+    H = targets.shape[1]
+    metrics: Dict[str, float] = {}
+    step_rmses, step_maes = [], []
+
+    for h in range(H):
+        rmse_h = float(np.sqrt(np.mean((targets[:, h] - preds[:, h]) ** 2)))
+        mae_h  = float(np.mean(np.abs(targets[:, h] - preds[:, h])))
+        metrics[f'rmse_step_{h + 1}'] = rmse_h
+        metrics[f'mae_step_{h + 1}']  = mae_h
+        step_rmses.append(rmse_h)
+        step_maes.append(mae_h)
+
+    metrics['mean_rmse'] = float(np.mean(step_rmses))
+    metrics['mean_mae']  = float(np.mean(step_maes))
+    return metrics
+
+
+def print_results_multistep(
+    model_metrics: Dict[str, Dict[str, float]],
+    task: str,
+    model_type: str,
+) -> None:
+    """Print multi-step regression metrics."""
+    print("\nResults (multi-step):")
+    for split in ('train', 'val'):
+        m = model_metrics[split]
+        print(f"  {split.capitalize()} Mean RMSE: {m['mean_rmse']:.3f}  |  Mean MAE: {m['mean_mae']:.3f}")
+        H = sum(1 for k in m if k.startswith('rmse_step_'))
+        step_str = '  '.join(f"h{h+1}={m[f'rmse_step_{h+1}']:.3f}" for h in range(H))
+        print(f"  {split.capitalize()} RMSE per step:  {step_str}")
+
+
 def evaluate_model(targets: np.ndarray, predictions: np.ndarray, task_type: str) -> Dict[str, float]:
     """Calculate performance metrics based on task type"""
     if task_type == 'classification':
@@ -163,7 +218,15 @@ def run_benchmark(task: str, model_type: str, include_treatments: bool = True,
                  gbm_learning_rate: float = 0.05,
                  gbm_subsample: float = 0.8,
                  gbm_colsample: float = 0.8,
-                 gbm_early_stopping: int = None):
+                 gbm_early_stopping: int = None,
+                 # LSTM multi-step
+                 lstm_output_dim: int = 1,
+                 # TFT hyperparameters
+                 tft_max_epochs: int = 30,
+                 tft_hidden_size: int = 32,
+                 tft_attention_heads: int = 4,
+                 tft_dropout: float = 0.1,
+                 tft_batch_size: int = 64):
     # Determine task type based on target column
     SCORE_TASKS = ['sofa_score', 'sirs_score', 'news2_score']
     TEMPORAL_TASKS = ['mechvent', 'septic_shock', 'sepsis', 'vasopressor'] + SCORE_TASKS
@@ -203,6 +266,90 @@ def run_benchmark(task: str, model_type: str, include_treatments: bool = True,
     val_features, val_targets = processor.prepare_data(val_df)
     train_features_norm, val_features_norm = processor.normalize_features(train_features, val_features)
     
+    # ── Multi-step path: Prophet and TFT operate on raw DataFrames ───────────
+    MULTISTEP_MODELS = ('prophet', 'tft', 'lstm_multistep')
+    if model_type in MULTISTEP_MODELS:
+        if task not in SCORE_TASKS:
+            raise ValueError(
+                f"model_type='{model_type}' only supports score tasks {SCORE_TASKS}, "
+                f"got '{task}'"
+            )
+        print(f"\nTraining {model_type} model (multi-step, H={prediction_horizon})...")
+
+        if model_type == 'prophet':
+            model = ProphetScoreModel(prediction_horizon=prediction_horizon)
+            model.fit(train_df, score_col=task)
+            train_preds, train_ids = model.predict(train_df, score_col=task)
+            val_preds,   val_ids   = model.predict(val_df,   score_col=task)
+            # Build matching actual arrays from the raw DataFrames
+            train_targets_ms = model.get_actual_multistep(train_df, train_ids, score_col=task)
+            val_targets_ms   = model.get_actual_multistep(val_df,   val_ids,   score_col=task)
+
+        elif model_type == 'tft':
+            model = TFTScoreModel(
+                prediction_horizon=prediction_horizon,
+                window_size=processor.window_size,
+                max_epochs=tft_max_epochs,
+                hidden_size=tft_hidden_size,
+                attention_head_size=tft_attention_heads,
+                dropout=tft_dropout,
+                batch_size=tft_batch_size,
+            )
+            model.fit(train_df, val_df, score_col=task, feature_cols=features)
+            val_preds   = model.predict(val_df,   score_col=task, feature_cols=features)
+            train_preds = model.predict(train_df, score_col=task, feature_cols=features)
+            # Actuals via processor multistep method
+            train_targets_ms, _ = processor.prepare_multistep_data(train_df)
+            # targets shape (N_windows, H) — align with preds
+            val_targets_ms, _   = processor.prepare_multistep_data(val_df)
+            # TFT may return fewer rows than windows if some patients are filtered
+            min_train = min(len(train_preds), len(train_targets_ms))
+            min_val   = min(len(val_preds),   len(val_targets_ms))
+            train_preds      = train_preds[:min_train]
+            train_targets_ms = train_targets_ms[:min_train]
+            val_preds        = val_preds[:min_val]
+            val_targets_ms   = val_targets_ms[:min_val]
+
+        elif model_type == 'lstm_multistep':
+            H = prediction_horizon
+            train_targets_ms, val_targets_ms_raw = None, None
+            # Use processor to get (N, H) targets
+            train_features_ms, train_targets_ms = processor.prepare_multistep_data(train_df)
+            val_features_ms,   val_targets_ms   = processor.prepare_multistep_data(val_df)
+            train_features_ms_norm, val_features_ms_norm = processor.normalize_features(
+                train_features_ms, val_features_ms
+            )
+            input_dim = train_features_ms_norm.shape[2]
+            model = LSTMModel(
+                task_type='regression',
+                input_dim=input_dim,
+                output_dim=H,
+            )
+            model.fit(train_features_ms_norm, train_targets_ms, batch_size=32)
+            train_preds = model.predict(train_features_ms_norm, batch_size=32)
+            val_preds   = model.predict(val_features_ms_norm,   batch_size=32)
+
+        model_metrics_ms = {
+            'train': evaluate_model_multistep(train_targets_ms, train_preds),
+            'val':   evaluate_model_multistep(val_targets_ms,   val_preds),
+        }
+        print_results_multistep(model_metrics_ms, task, model_type)
+
+        result = {
+            'task': task,
+            'model_type': model_type,
+            'include_treatments': include_treatments,
+            'prediction_horizon': prediction_horizon,
+            'regularization': regularization,
+            'alpha': alpha,
+        }
+        for split in ('train', 'val'):
+            for metric, value in model_metrics_ms[split].items():
+                result[f'{split}_{metric}'] = value
+        return result
+
+    # ── Single-step path (all existing models) ────────────────────────────────
+
     # Configure batch size based on model type
     batch_size = 32 if model_type in ['lstm', 'transformer'] else None
     
@@ -223,14 +370,14 @@ def run_benchmark(task: str, model_type: str, include_treatments: bool = True,
             print("Using Logistic Regression for classification task")
             
         model = LinearTimeSeriesModel(
-            task_type=task_type, 
+            task_type=task_type,
             random_state=random_state,
             regularization=regularization if task_type == 'regression' else None,
             alpha=alpha
         )
     elif model_type == 'lstm':
         input_dim = train_features_norm.shape[2]
-        model = LSTMModel(task_type=task_type, input_dim=input_dim)
+        model = LSTMModel(task_type=task_type, input_dim=input_dim, output_dim=1)
     elif model_type == 'transformer':
         model = TimeSeriesTransformer(task_type=task_type)
     elif model_type == 'xgboost':
@@ -257,7 +404,8 @@ def run_benchmark(task: str, model_type: str, include_treatments: bool = True,
         )
     else:
         raise ValueError(f"Invalid model type: {model_type}. "
-                         f"Choose from: linear, lstm, transformer, xgboost, lightgbm")
+                         f"Choose from: linear, lstm, lstm_multistep, transformer, "
+                         f"xgboost, lightgbm, prophet, tft")
     
     if batch_size:
         # For LSTM and Transformer models, use batched training
@@ -459,8 +607,9 @@ if __name__ == "__main__":
     parser.add_argument("--run_selected", action="store_true", help="Run all models for a specific task")
     parser.add_argument("--task", type=str, default="mechvent", help="Target column name")
     parser.add_argument("--model_type", type=str, default="lstm",
-                        choices=["linear", "lstm", "transformer", "xgboost", "lightgbm"],
-                        help="Model type")
+                        choices=["linear", "lstm", "lstm_multistep", "transformer",
+                                 "xgboost", "lightgbm", "prophet", "tft"],
+                        help="Model type (lstm_multistep/prophet/tft output H steps ahead)")
     parser.add_argument("--include_treatments", type=bool, default=False,
                         help="Whether to include treatment variables")
     parser.add_argument("--prediction_horizon", type=int, default=6,
@@ -490,6 +639,22 @@ if __name__ == "__main__":
                         help="[xgboost/lightgbm] Column sub-sampling ratio per tree (default: 0.8)")
     parser.add_argument("--gbm_early_stopping", type=int, default=None,
                         help="[xgboost/lightgbm] Early stopping rounds (default: disabled)")
+    # ── TFT / LSTM-multistep hyperparameters ────────────────────────────────
+    parser.add_argument("--tft_max_epochs", type=int, default=30,
+                        help="[tft] Max training epochs (default: 30)")
+    parser.add_argument("--tft_hidden_size", type=int, default=32,
+                        help="[tft] Hidden layer size (default: 32)")
+    parser.add_argument("--tft_attention_heads", type=int, default=4,
+                        help="[tft] Number of attention heads (default: 4)")
+    parser.add_argument("--tft_dropout", type=float, default=0.1,
+                        help="[tft] Dropout rate (default: 0.1)")
+    parser.add_argument("--tft_batch_size", type=int, default=64,
+                        help="[tft] Batch size (default: 64)")
+    parser.add_argument("--output_csv", type=str,
+                        default="results/score_benchmark.csv",
+                        help="CSV file to append results to (created if missing, default: results/score_benchmark.csv)")
+    parser.add_argument("--run_tag", type=str, default="",
+                        help="Free-form label added as a 'run_tag' column for tracking experiment variants")
 
     args = parser.parse_args()
 
@@ -521,7 +686,19 @@ if __name__ == "__main__":
             gbm_subsample=args.gbm_subsample,
             gbm_colsample=args.gbm_colsample,
             gbm_early_stopping=args.gbm_early_stopping,
+            lstm_output_dim=args.prediction_horizon if args.model_type == 'lstm_multistep' else 1,
+            tft_max_epochs=args.tft_max_epochs,
+            tft_hidden_size=args.tft_hidden_size,
+            tft_attention_heads=args.tft_attention_heads,
+            tft_dropout=args.tft_dropout,
+            tft_batch_size=args.tft_batch_size,
         )
-        # Save single result to CSV
-        pd.DataFrame([result]).to_csv("single_benchmark_result.csv", index=False)
-        print(f"Result saved to single_benchmark_result.csv")
+        # Append result to shared CSV with run_tag and timestamp
+        result['run_tag'] = args.run_tag
+        result['timestamp'] = datetime.now().strftime("%Y-%m-%d-%H:%M:%S")
+        out_path = args.output_csv
+        os.makedirs(os.path.dirname(out_path) if os.path.dirname(out_path) else ".", exist_ok=True)
+        row_df = pd.DataFrame([result])
+        write_header = not os.path.exists(out_path)
+        row_df.to_csv(out_path, mode='a', index=False, header=write_header)
+        print(f"Result appended to {out_path}")

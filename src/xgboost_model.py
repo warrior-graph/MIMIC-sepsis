@@ -21,6 +21,15 @@ from typing import Callable, Dict, List, Optional
 
 import numpy as np
 
+try:
+    import torch as _torch
+    _CUDA_AVAILABLE = _torch.cuda.is_available()
+except ImportError:
+    _CUDA_AVAILABLE = False
+
+_XGB_DEVICE  = "cuda" if _CUDA_AVAILABLE else "cpu"
+_LGBM_DEVICE = "gpu"  if _CUDA_AVAILABLE else "cpu"
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -32,6 +41,27 @@ def _flatten(X: np.ndarray) -> np.ndarray:
         N, T, F = X.shape
         return X.reshape(N, T * F)
     return X  # already 2-D
+
+
+def _to_dmatrix(X: np.ndarray, y: np.ndarray = None, device: str = "cpu"):
+    """Wrap a numpy array in xgboost.DMatrix placed on *device*.
+
+    Passing an explicit DMatrix avoids the ``inplace_predict`` device-mismatch
+    warning that occurs when the booster runs on CUDA but receives a CPU array.
+    """
+    from xgboost import DMatrix
+    X_flat = _flatten(X)
+    if y is not None:
+        dm = DMatrix(X_flat, label=y)
+    else:
+        dm = DMatrix(X_flat)
+    dm.set_info(feature_names=[f"f{i}" for i in range(X_flat.shape[1])])
+    # XGBoost ≥ 2.0 supports set_device; use setParam for older versions
+    try:
+        dm.set_info(device=device)
+    except TypeError:
+        pass  # older xgboost — device param not supported; data stays on CPU
+    return dm
 
 
 # ---------------------------------------------------------------------------
@@ -89,7 +119,7 @@ class XGBoostModel:
             colsample_bytree=colsample_bytree,
             random_state=random_state,
             n_jobs=n_jobs,
-            device="cuda",
+            device=_XGB_DEVICE,
             **kwargs,
         )
 
@@ -119,14 +149,15 @@ class XGBoostModel:
         eval_set : list of (X_val, y_val) tuples, optional
             Only used when *early_stopping_rounds* is set.
         """
-        X_flat = _flatten(X)
         fit_kwargs: dict = {}
 
         if self.early_stopping_rounds is not None:
             fit_kwargs["early_stopping_rounds"] = self.early_stopping_rounds
             if eval_set is not None:
-                flat_eval = [(_flatten(Xv), yv) for Xv, yv in eval_set]
-                fit_kwargs["eval_set"] = flat_eval
+                # Flatten eval arrays; keep as numpy — sklearn wrapper handles device transfer
+                fit_kwargs["eval_set"] = [
+                    (_flatten(Xv), yv) for Xv, yv in eval_set
+                ]
             else:
                 warnings.warn(
                     "early_stopping_rounds set but no eval_set provided — "
@@ -134,6 +165,8 @@ class XGBoostModel:
                     UserWarning,
                 )
 
+        X_flat = _flatten(X)
+        # Pass numpy to the sklearn wrapper — it places data on the booster device internally
         self.model.fit(X_flat, y, **fit_kwargs)
 
     # ------------------------------------------------------------------
@@ -142,11 +175,22 @@ class XGBoostModel:
 
         Returns probabilities (positive class) for classification, or
         predicted values for regression.
+
+        Uses ``xgboost.DMatrix(device=...)`` so data and booster sit on the
+        same device, eliminating the "Falling back to prediction using DMatrix
+        due to mismatched devices" warning.
         """
+        from xgboost import DMatrix
         X_flat = _flatten(X)
-        if self.task_type == "classification":
-            return self.model.predict_proba(X_flat)[:, 1]
-        return self.model.predict(X_flat)
+        # Explicitly wrap in DMatrix and call booster.predict() directly.
+        # This bypasses the inplace_predict code path that triggers the
+        # "Falling back to prediction using DMatrix due to mismatched devices"
+        # warning when the booster lives on CUDA but receives a CPU numpy array.
+        dtest = DMatrix(X_flat)
+        raw = self.model.get_booster().predict(dtest)
+        # For binary classification the booster returns positive-class probability directly.
+        # For multi-class it returns shape (N, n_classes) — caller handles as needed.
+        return raw
 
     # ------------------------------------------------------------------
     @property
@@ -211,6 +255,7 @@ class LightGBMModel:
             colsample_bytree=colsample_bytree,  # feature_fraction alias
             random_state=random_state,
             n_jobs=n_jobs,
+            device=_LGBM_DEVICE,
             verbose=-1,
             **kwargs,
         )

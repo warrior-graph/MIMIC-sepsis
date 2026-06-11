@@ -5,14 +5,32 @@ import numpy as np
 from typing import Dict, Tuple
 
 class LSTMModel(nn.Module):
-    def __init__(self, 
+    def __init__(self,
                  input_dim: int,
                  hidden_dim: int = 64,
                  num_layers: int = 2,
                  dropout: float = 0.1,
-                 task_type: str = 'classification'):
+                 task_type: str = 'classification',
+                 output_dim: int = 1):
+        """
+        Parameters
+        ----------
+        input_dim : int
+            Number of input features per timestep.
+        hidden_dim : int
+            LSTM hidden state size.
+        num_layers : int
+            Number of stacked LSTM layers.
+        dropout : float
+        task_type : str
+            'classification' or 'regression'
+        output_dim : int
+            1 for single-step output (default, backward-compatible).
+            H > 1 for multi-step output — forward() returns shape (N, H).
+        """
         super().__init__()
         self.task_type = task_type
+        self.output_dim = output_dim
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
         # LSTM for processing input sequence
@@ -24,12 +42,12 @@ class LSTMModel(nn.Module):
             batch_first=True
         )
         
-        # Output layers
+        # Output layers — last Linear produces output_dim values
         self.output_layer = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1)
+            nn.Linear(hidden_dim, output_dim)
         )
         
         if task_type == 'classification':
@@ -43,12 +61,22 @@ class LSTMModel(nn.Module):
         # Take the last hidden state
         last_hidden = lstm_out[:, -1, :]
         
-        output = self.output_layer(last_hidden)
-        return self.output_activation(output).squeeze()
+        output = self.output_layer(last_hidden)          # (N, output_dim)
+        output = self.output_activation(output)
+        # For single-step (output_dim=1) squeeze to (N,) for backward compatibility
+        if self.output_dim == 1:
+            return output.squeeze(-1)
+        return output                                    # (N, H) for multi-step
     
-    def fit(self, X: np.ndarray, y: np.ndarray, batch_size: int = 32, epochs: int = 10, 
+    def fit(self, X: np.ndarray, y: np.ndarray, batch_size: int = 32, epochs: int = 10,
             learning_rate: float = 0.001, random_state: int = None):
-        """Train the LSTM model"""
+        """Train the LSTM model.
+
+        Parameters
+        ----------
+        X : np.ndarray, shape (N, T, F)
+        y : np.ndarray, shape (N,) for single-step or (N, H) for multi-step
+        """
         self.to(self.device)
         
         # Set random seed for reproducibility if provided
@@ -71,6 +99,7 @@ class LSTMModel(nn.Module):
         
         # Initialize optimizer and loss function
         optimizer = torch.optim.Adam(self.parameters(), lr=learning_rate)
+        # Multi-step regression uses MSELoss over (N, H); classification uses BCE over (N,)
         criterion = nn.BCELoss() if self.task_type == 'classification' else nn.MSELoss()
         
         # Training loop

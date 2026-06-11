@@ -400,6 +400,104 @@ class TimeSeriesDataProcessor:
 
         return np.array(features), np.array(targets, dtype=np.float32)
 
+    def _prepare_score_multistep_data(
+        self,
+        df: pd.DataFrame,
+        score_col: str,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Sliding-window regression returning the full future sequence as target.
+
+        Identical window extraction to ``_prepare_score_regression_data`` except
+        the target is the complete future sequence of length ``prediction_horizon``
+        rather than its mean — yielding ``y`` shape ``(N, H)``.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+        score_col : str
+            One of 'sofa_score', 'sirs_score', 'news2_score'.
+
+        Returns
+        -------
+        X : np.ndarray, shape (N, window_size, n_features)
+        y : np.ndarray, shape (N, prediction_horizon), dtype float32
+        """
+        if self.prediction_horizon is None:
+            raise ValueError(
+                f"prediction_horizon must be set for multistep score task '{score_col}'"
+            )
+        if score_col not in df.columns:
+            raise ValueError(f"Score column '{score_col}' not found in DataFrame.")
+
+        grouped = df.groupby('stay_id')
+        features, targets = [], []
+
+        print(f"Processing {score_col} multistep data (H={self.prediction_horizon})...")
+        bar = pyprind.ProgBar(len(grouped))
+        for _, group in grouped:
+            group = group.sort_values('timestep')
+
+            for i in range(len(group) - self.window_size - self.prediction_horizon + 1):
+                window = group.iloc[i:i + self.window_size]
+                if len(window) == self.window_size:
+                    features.append(window[self.features].values)
+
+                    future_window = group.iloc[
+                        i + self.window_size:
+                        i + self.window_size + self.prediction_horizon
+                    ]
+                    # Keep full future sequence — shape (H,)
+                    future_seq = future_window[score_col].values.astype(np.float32)
+                    if len(future_seq) == self.prediction_horizon:
+                        targets.append(future_seq)
+                    else:
+                        # Pad with NaN if sequence is shorter than horizon (edge case)
+                        padded = np.full(self.prediction_horizon, np.nan, dtype=np.float32)
+                        padded[:len(future_seq)] = future_seq
+                        targets.append(padded)
+            bar.update()
+
+        return np.array(features), np.array(targets, dtype=np.float32)
+
+    def prepare_multistep_data(self, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+        """Public entry point for multi-step score prediction.
+
+        Only score regression tasks are supported (sofa_score, sirs_score, news2_score).
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+
+        Returns
+        -------
+        X : np.ndarray, shape (N, window_size, n_features)
+        y : np.ndarray, shape (N, prediction_horizon), dtype float32
+        """
+        SCORE_TASKS = ('sofa_score', 'sirs_score', 'news2_score')
+        if self.task not in SCORE_TASKS:
+            raise ValueError(
+                f"prepare_multistep_data() only supports score tasks {SCORE_TASKS}, "
+                f"got '{self.task}'"
+            )
+        X, y = self._prepare_score_multistep_data(df, self.task)
+        if self.balance and len(X) > 0:
+            rng = np.random.default_rng(self.random_state)
+            y_mean = y.mean(axis=1)
+            n_bins = 10
+            bin_edges = np.nanpercentile(y_mean, np.linspace(0, 100, n_bins + 1))
+            bin_edges[-1] += 1e-6
+            bin_ids = np.digitize(y_mean, bin_edges[1:])
+            unique_bins, counts = np.unique(bin_ids, return_counts=True)
+            min_count = counts.min()
+            keep_idx = []
+            for b in unique_bins:
+                bin_mask = np.where(bin_ids == b)[0]
+                keep_idx.extend(rng.choice(bin_mask, size=min_count, replace=False).tolist())
+            keep_idx = np.array(keep_idx)
+            rng.shuffle(keep_idx)
+            X, y = X[keep_idx], y[keep_idx]
+        return X, y
+
     def balance_windows(
         self,
         features: np.ndarray,
