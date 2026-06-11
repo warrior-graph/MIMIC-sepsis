@@ -5,6 +5,7 @@ from data_processor import TimeSeriesDataProcessor
 from linear_model import LinearTimeSeriesModel
 from lstm_model import LSTMModel
 from transformer_model import TimeSeriesTransformer
+from xgboost_model import XGBoostModel, LightGBMModel
 from sklearn.metrics import roc_auc_score, average_precision_score, mean_squared_error, mean_absolute_error
 from typing import Dict, Tuple
 import matplotlib.pyplot as plt
@@ -155,7 +156,14 @@ def run_benchmark(task: str, model_type: str, include_treatments: bool = True,
                  prediction_horizon: int = None, random_state: int = 42,
                  regularization: str = 'ridge', alpha: float = 1.0,
                  balance: bool = False, balance_strategy: str = 'undersample',
-                 data_path: str = "processed_files/patient_timeseries_v4.csv"):
+                 data_path: str = "processed_files/patient_timeseries_v4.csv",
+                 # XGBoost / LightGBM hyperparameters
+                 gbm_n_estimators: int = 300,
+                 gbm_max_depth: int = 6,
+                 gbm_learning_rate: float = 0.05,
+                 gbm_subsample: float = 0.8,
+                 gbm_colsample: float = 0.8,
+                 gbm_early_stopping: int = None):
     # Determine task type based on target column
     SCORE_TASKS = ['sofa_score', 'sirs_score', 'news2_score']
     TEMPORAL_TASKS = ['mechvent', 'septic_shock', 'sepsis', 'vasopressor'] + SCORE_TASKS
@@ -225,19 +233,64 @@ def run_benchmark(task: str, model_type: str, include_treatments: bool = True,
         model = LSTMModel(task_type=task_type, input_dim=input_dim)
     elif model_type == 'transformer':
         model = TimeSeriesTransformer(task_type=task_type)
+    elif model_type == 'xgboost':
+        model = XGBoostModel(
+            task_type=task_type,
+            n_estimators=gbm_n_estimators,
+            max_depth=gbm_max_depth,
+            learning_rate=gbm_learning_rate,
+            subsample=gbm_subsample,
+            colsample_bytree=gbm_colsample,
+            random_state=random_state,
+            early_stopping_rounds=gbm_early_stopping,
+        )
+    elif model_type == 'lightgbm':
+        model = LightGBMModel(
+            task_type=task_type,
+            n_estimators=gbm_n_estimators,
+            max_depth=gbm_max_depth,
+            learning_rate=gbm_learning_rate,
+            subsample=gbm_subsample,
+            colsample_bytree=gbm_colsample,
+            random_state=random_state,
+            early_stopping_rounds=gbm_early_stopping,
+        )
     else:
-        raise ValueError(f"Invalid model type: {model_type}")
+        raise ValueError(f"Invalid model type: {model_type}. "
+                         f"Choose from: linear, lstm, transformer, xgboost, lightgbm")
     
     if batch_size:
         # For LSTM and Transformer models, use batched training
         model.fit(train_features_norm, train_targets, batch_size=batch_size)
         train_preds = model.predict(train_features_norm, batch_size=batch_size)
         val_preds = model.predict(val_features_norm, batch_size=batch_size)
+    elif model_type in ('xgboost', 'lightgbm') and gbm_early_stopping is not None:
+        # Pass validation set for early stopping
+        model.fit(
+            train_features_norm, train_targets,
+            eval_set=[(val_features_norm, val_targets)],
+        )
+        train_preds = model.predict(train_features_norm)
+        val_preds = model.predict(val_features_norm)
     else:
-        # For linear model, use regular training
+        # Linear, XGBoost (no early stopping), LightGBM (no early stopping)
         model.fit(train_features_norm, train_targets)
         train_preds = model.predict(train_features_norm)
         val_preds = model.predict(val_features_norm)
+
+    # Print feature importances for tree-based models
+    if hasattr(model, 'feature_importances_') and model_type in ('xgboost', 'lightgbm'):
+        fi = model.feature_importances_
+        # Build flat feature names: f0_t0, f0_t1, ...
+        n_timesteps = train_features_norm.shape[1]
+        n_feats = train_features_norm.shape[2]
+        flat_names = [f"{features[fi_idx % n_feats]}_t{fi_idx // n_feats}"
+                      for fi_idx in range(n_timesteps * n_feats)]
+        top_n = min(20, len(flat_names))
+        top_idx = np.argsort(fi)[::-1][:top_n]
+        print(f"\nTop-{top_n} feature importances ({model_type}):")
+        for rank, idx in enumerate(top_idx, 1):
+            print(f"  {rank:2d}. {flat_names[idx]:<35s} {fi[idx]:.4f}")
     
     # Calculate metrics
     model_metrics = {
@@ -405,7 +458,9 @@ if __name__ == "__main__":
     parser.add_argument("--run_all", action="store_true", help="Run all experiments")
     parser.add_argument("--run_selected", action="store_true", help="Run all models for a specific task")
     parser.add_argument("--task", type=str, default="mechvent", help="Target column name")
-    parser.add_argument("--model_type", type=str, default="lstm", help="Model type")
+    parser.add_argument("--model_type", type=str, default="lstm",
+                        choices=["linear", "lstm", "transformer", "xgboost", "lightgbm"],
+                        help="Model type")
     parser.add_argument("--include_treatments", type=bool, default=False,
                         help="Whether to include treatment variables")
     parser.add_argument("--prediction_horizon", type=int, default=6,
@@ -422,6 +477,19 @@ if __name__ == "__main__":
     parser.add_argument("--data_path", type=str,
                         default="processed_files/patient_timeseries_v4.csv",
                         help="Path to patient timeseries CSV (use _balanced.csv for pre-balanced data)")
+    # ── XGBoost / LightGBM hyperparameters ──────────────────────────────────
+    parser.add_argument("--gbm_n_estimators", type=int, default=300,
+                        help="[xgboost/lightgbm] Number of boosting rounds (default: 300)")
+    parser.add_argument("--gbm_max_depth", type=int, default=6,
+                        help="[xgboost/lightgbm] Max tree depth; -1 = unlimited for LightGBM (default: 6)")
+    parser.add_argument("--gbm_learning_rate", type=float, default=0.05,
+                        help="[xgboost/lightgbm] Learning rate / shrinkage (default: 0.05)")
+    parser.add_argument("--gbm_subsample", type=float, default=0.8,
+                        help="[xgboost/lightgbm] Row sub-sampling ratio (default: 0.8)")
+    parser.add_argument("--gbm_colsample", type=float, default=0.8,
+                        help="[xgboost/lightgbm] Column sub-sampling ratio per tree (default: 0.8)")
+    parser.add_argument("--gbm_early_stopping", type=int, default=None,
+                        help="[xgboost/lightgbm] Early stopping rounds (default: disabled)")
 
     args = parser.parse_args()
 
@@ -447,6 +515,12 @@ if __name__ == "__main__":
             balance=args.balance,
             balance_strategy=args.balance_strategy,
             data_path=args.data_path,
+            gbm_n_estimators=args.gbm_n_estimators,
+            gbm_max_depth=args.gbm_max_depth,
+            gbm_learning_rate=args.gbm_learning_rate,
+            gbm_subsample=args.gbm_subsample,
+            gbm_colsample=args.gbm_colsample,
+            gbm_early_stopping=args.gbm_early_stopping,
         )
         # Save single result to CSV
         pd.DataFrame([result]).to_csv("single_benchmark_result.csv", index=False)
