@@ -1,7 +1,9 @@
 # Plan: Multi-Score Prediction with Balanced Database
 
-> **Last updated:** Root cause of near-100 % risk-score rates identified and fixed (2026-06-12).
-> See **Root Cause & Fix** section below.
+> **Last updated:** Score tasks converted from mean-regression to binary threshold-exceedance
+> classification (2026-06-12). See **Score Task Paradigm** section below.
+> Root cause of near-100 % risk-score rates also identified and fixed (2026-06-12).
+> See **Root Cause & Fix** section.
 
 ---
 
@@ -279,22 +281,48 @@ Inject `balance_windows()` as an optional step in `prepare_data()` via a `balanc
 
 ---
 
-### Step 6 — Add Score Prediction Tasks to `TimeSeriesDataProcessor`
+### Step 6 — Score Prediction as Binary Threshold-Exceedance Classification
 
-**File:** [`src/data_processor.py`](src/data_processor.py:27)
+> **Paradigm change (2026-06-12):** Score tasks were originally designed as mean-regression
+> (predict average future score). They have been redesigned as **binary classification** tasks
+> to match the clinical question: *"Will this patient's score exceed its clinical threshold
+> within the next H timesteps?"*
 
-Add three new branches in `prepare_data()`:
+#### Output contract
+
+| Output | Type | Description |
+|--------|------|-------------|
+| Ground-truth `y` | `{0, 1}` | 1 if ANY future timestep has `score >= threshold` |
+| Model output `ŷ` | `float ∈ [0, 1]` | Probability of threshold exceedance |
+| Hard binary decision | `{0, 1}` | `ŷ >= decision_threshold` (default 0.5) |
+
+#### Clinical thresholds (module-level `SCORE_THRESHOLDS`)
+
+| Score | Default threshold | Clinical meaning |
+|-------|-------------------|-----------------|
+| `sofa_score` | 2 | Organ dysfunction (Sepsis-3) |
+| `sirs_score` | 2 | Systemic inflammatory response |
+| `news2_score` | 5 | Medium clinical risk (escalation trigger) |
+
+Thresholds are overridable via CLI args `--sofa_threshold`, `--sirs_threshold`, `--news2_threshold`.
+
+#### Metrics reported
+
+- **AUROC** — threshold-free ranking quality
+- **AUPRC** — precision-recall quality (better for imbalanced data)
+- **Accuracy** — hard binary decision at `decision_threshold` (overridable via `--decision_threshold`)
+
+#### Key method: `_prepare_score_threshold_data(df, score_col, threshold)`
 
 ```python
-elif self.task == 'sofa_score':
-    return self._prepare_score_regression_data(df, 'sofa_score')
-elif self.task == 'sirs_score':
-    return self._prepare_score_regression_data(df, 'sirs_score')
-elif self.task == 'news2_score':
-    return self._prepare_score_regression_data(df, 'news2_score')
+# Binary label: 1 if score exceeds threshold in ANY future step
+exceeds = int(future_window[score_col].max() >= threshold)
+targets.append(exceeds)
 ```
 
-Add `_prepare_score_regression_data()` which uses sliding windows (same as septic_shock) but returns the **future score value** (float) rather than a binary onset flag. Optionally binarise into high/low risk via a threshold argument for classification benchmarks.
+Returns `y` as `np.int8` array shape `(N,)`.
+All existing classifiers (linear logistic, LSTM, transformer, XGBoost, LightGBM) output
+`P ∈ [0, 1]` without any model changes.
 
 ---
 

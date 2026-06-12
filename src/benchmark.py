@@ -141,16 +141,31 @@ def print_results_multistep(
         print(f"  {split.capitalize()} RMSE per step:  {step_str}")
 
 
-def evaluate_model(targets: np.ndarray, predictions: np.ndarray, task_type: str) -> Dict[str, float]:
-    """Calculate performance metrics based on task type"""
+def evaluate_model(targets: np.ndarray, predictions: np.ndarray, task_type: str,
+                   decision_threshold: float = 0.5) -> Dict[str, float]:
+    """Calculate performance metrics based on task type.
+
+    Parameters
+    ----------
+    targets : np.ndarray
+        Ground-truth labels (binary for classification, continuous for regression).
+    predictions : np.ndarray
+        Model outputs: probability in [0, 1] for classification, continuous for regression.
+    task_type : str
+        'classification' or 'regression'.
+    decision_threshold : float
+        Probability cut-off for hard binary prediction (default 0.5).
+        Only used for classification tasks.
+    """
     if task_type == 'classification':
-        # Convert probability predictions to binary predictions using 0.5 threshold
-        binary_predictions = (predictions >= 0.5).astype(int)
+        # Continuous probability → hard binary decision at decision_threshold
+        binary_predictions = (predictions >= decision_threshold).astype(int)
         accuracy = np.mean(binary_predictions == targets)
         return {
             'auroc': roc_auc_score(targets, predictions),
             'auprc': average_precision_score(targets, predictions),
-            'accuracy': accuracy
+            'accuracy': accuracy,
+            'decision_threshold': decision_threshold,
         }
     else:  # regression
         mse = np.mean((targets - predictions) ** 2)
@@ -160,20 +175,22 @@ def evaluate_model(targets: np.ndarray, predictions: np.ndarray, task_type: str)
             'mae': np.mean(np.abs(targets - predictions))
         }
 
-def get_baseline_metrics(train_targets: np.ndarray, val_targets: np.ndarray, task_type: str) -> Dict[str, Dict[str, float]]:
+def get_baseline_metrics(train_targets: np.ndarray, val_targets: np.ndarray,
+                         task_type: str,
+                         decision_threshold: float = 0.5) -> Dict[str, Dict[str, float]]:
     """Calculate baseline performance based on task type"""
     if task_type == 'classification':
         majority_pred = train_targets.mean() > 0.5
-        train_baseline = np.ones_like(train_targets) * majority_pred
-        val_baseline = np.ones_like(val_targets) * majority_pred
+        train_baseline = np.ones_like(train_targets, dtype=float) * majority_pred
+        val_baseline   = np.ones_like(val_targets,   dtype=float) * majority_pred
     else:  # regression
         mean_pred = np.mean(train_targets)
         train_baseline = np.ones_like(train_targets) * mean_pred
-        val_baseline = np.ones_like(val_targets) * mean_pred
-    
+        val_baseline   = np.ones_like(val_targets)   * mean_pred
+
     return {
-        'train': evaluate_model(train_targets, train_baseline, task_type),
-        'val': evaluate_model(val_targets, val_baseline, task_type)
+        'train': evaluate_model(train_targets, train_baseline, task_type, decision_threshold),
+        'val':   evaluate_model(val_targets,   val_baseline,   task_type, decision_threshold),
     }
 
 def print_results(model_metrics: Dict[str, Dict[str, float]], baseline_metrics: Dict[str, Dict[str, float]], task_type: str):
@@ -212,6 +229,9 @@ def run_benchmark(task: str, model_type: str, include_treatments: bool = True,
                  regularization: str = 'ridge', alpha: float = 1.0,
                  balance: bool = False, balance_strategy: str = 'undersample',
                  data_path: str = "processed_files/patient_timeseries_v4.csv",
+                 # Score threshold-exceedance parameters
+                 score_thresholds: dict = None,
+                 decision_threshold: float = 0.5,
                  # XGBoost / LightGBM hyperparameters
                  gbm_n_estimators: int = 300,
                  gbm_max_depth: int = 6,
@@ -227,10 +247,11 @@ def run_benchmark(task: str, model_type: str, include_treatments: bool = True,
                  tft_attention_heads: int = 4,
                  tft_dropout: float = 0.1,
                  tft_batch_size: int = 64):
-    # Determine task type based on target column
+    # Determine task type based on target column.
+    # Score tasks are binary threshold-exceedance classification, not regression.
     SCORE_TASKS = ['sofa_score', 'sirs_score', 'news2_score']
     TEMPORAL_TASKS = ['mechvent', 'septic_shock', 'sepsis', 'vasopressor'] + SCORE_TASKS
-    task_type = 'regression' if task in ['los'] + SCORE_TASKS else 'classification'
+    task_type = 'regression' if task in ['los'] else 'classification'
 
     # Load and prepare data
     df = load_data(data_path)
@@ -254,6 +275,7 @@ def run_benchmark(task: str, model_type: str, include_treatments: bool = True,
         balance=balance,
         balance_strategy=balance_strategy,
         random_state=random_state,
+        score_thresholds=score_thresholds,  # None → uses module-level SCORE_THRESHOLDS
     )
 
     
@@ -442,11 +464,12 @@ def run_benchmark(task: str, model_type: str, include_treatments: bool = True,
     
     # Calculate metrics
     model_metrics = {
-        'train': evaluate_model(train_targets, train_preds, task_type),
-        'val': evaluate_model(val_targets, val_preds, task_type)
+        'train': evaluate_model(train_targets, train_preds, task_type, decision_threshold),
+        'val':   evaluate_model(val_targets,   val_preds,   task_type, decision_threshold),
     }
-    
-    baseline_metrics = get_baseline_metrics(train_targets, val_targets, task_type)
+
+    baseline_metrics = get_baseline_metrics(train_targets, val_targets, task_type,
+                                            decision_threshold)
     
     # Print results
     print_results(model_metrics, baseline_metrics, task_type)
@@ -554,8 +577,10 @@ def run_all_experiments():
     return results
 
 def run_selected_experiments(task: str, include_treatments: bool = False,
-                             balance: bool = False,
-                             balance_strategy: str = 'undersample'):
+                              balance: bool = False,
+                              balance_strategy: str = 'undersample',
+                              score_thresholds: dict = None,
+                              decision_threshold: float = 0.5):
     """Run experiments with all models for a specific task and treatment setting"""
     model_types = ['linear', 'lstm', 'transformer']
 
@@ -586,7 +611,9 @@ def run_selected_experiments(task: str, include_treatments: bool = False,
                 task=task,
                 model_type=model_type,
                 include_treatments=include_treatments,
-                prediction_horizon=horizon
+                prediction_horizon=horizon,
+                score_thresholds=score_thresholds,
+                decision_threshold=decision_threshold,
             )
             results.append(result)
             
@@ -626,6 +653,17 @@ if __name__ == "__main__":
     parser.add_argument("--data_path", type=str,
                         default="processed_files/patient_timeseries_v4.csv",
                         help="Path to patient timeseries CSV (use _balanced.csv for pre-balanced data)")
+    # ── Score threshold-exceedance parameters ───────────────────────────────
+    parser.add_argument("--sofa_threshold", type=int, default=2,
+                        help="SOFA score exceedance threshold (default: 2 = Sepsis-3 criterion)")
+    parser.add_argument("--sirs_threshold", type=int, default=2,
+                        help="SIRS score exceedance threshold (default: 2 = SIRS criterion)")
+    parser.add_argument("--news2_threshold", type=int, default=5,
+                        help="NEWS2 score exceedance threshold (default: 5 = medium clinical risk)")
+    parser.add_argument("--decision_threshold", type=float, default=0.5,
+                        help="Probability cut-off for hard binary prediction (default: 0.5). "
+                             "Only used for classification tasks. Affects Accuracy; "
+                             "AUROC and AUPRC are threshold-free.")
     # ── XGBoost / LightGBM hyperparameters ──────────────────────────────────
     parser.add_argument("--gbm_n_estimators", type=int, default=300,
                         help="[xgboost/lightgbm] Number of boosting rounds (default: 300)")
@@ -664,10 +702,22 @@ if __name__ == "__main__":
     TEMPORAL_TASKS = ['septic_shock', 'mechvent', 'sepsis', 'vasopressor',
                       'sofa_score', 'sirs_score', 'news2_score']
 
+    # Build per-score thresholds dict from CLI args
+    _score_thresholds = {
+        'sofa_score':  args.sofa_threshold,
+        'sirs_score':  args.sirs_threshold,
+        'news2_score': args.news2_threshold,
+    }
+
     if args.run_all:
         run_all_experiments()
     elif args.run_selected:
-        run_selected_experiments(args.task, args.include_treatments)
+        run_selected_experiments(
+            args.task,
+            args.include_treatments,
+            score_thresholds=_score_thresholds,
+            decision_threshold=args.decision_threshold,
+        )
     else:
         result = run_benchmark(
             args.task,
@@ -680,6 +730,8 @@ if __name__ == "__main__":
             balance=args.balance,
             balance_strategy=args.balance_strategy,
             data_path=args.data_path,
+            score_thresholds=_score_thresholds,
+            decision_threshold=args.decision_threshold,
             gbm_n_estimators=args.gbm_n_estimators,
             gbm_max_depth=args.gbm_max_depth,
             gbm_learning_rate=args.gbm_learning_rate,

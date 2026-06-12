@@ -7,6 +7,20 @@ import warnings
 
 
 # ---------------------------------------------------------------------------
+# Module-level constants
+# ---------------------------------------------------------------------------
+
+# Clinical thresholds that define "at-risk" for each score.
+# A patient is considered a positive event if ANY timestep in the future
+# window has a score >= the corresponding threshold.
+SCORE_THRESHOLDS: Dict[str, int] = {
+    'sofa_score':  2,   # SOFA ≥ 2 → organ dysfunction (Sepsis-3)
+    'sirs_score':  2,   # SIRS ≥ 2 → systemic inflammatory response
+    'news2_score': 5,   # NEWS2 ≥ 5 → medium clinical risk (escalation trigger)
+}
+
+
+# ---------------------------------------------------------------------------
 # Module-level helpers
 # ---------------------------------------------------------------------------
 
@@ -107,7 +121,8 @@ class TimeSeriesDataProcessor:
                  prediction_horizon: int = None,
                  balance: bool = False,
                  balance_strategy: str = 'undersample',
-                 random_state: int = 42):
+                 random_state: int = 42,
+                 score_thresholds: Optional[Dict[str, int]] = None):
         """
         Parameters
         ----------
@@ -122,6 +137,11 @@ class TimeSeriesDataProcessor:
         balance_strategy : str
             'undersample' | 'oversample' | 'combined'
         random_state : int
+        score_thresholds : dict, optional
+            Per-score clinical exceedance thresholds used by score tasks.
+            Keys: 'sofa_score', 'sirs_score', 'news2_score'.
+            Defaults to module-level SCORE_THRESHOLDS if None.
+            Example: {'sofa_score': 3, 'sirs_score': 2, 'news2_score': 7}
         """
         self.features = features
         self.task = task
@@ -130,6 +150,7 @@ class TimeSeriesDataProcessor:
         self.balance = balance
         self.balance_strategy = balance_strategy
         self.random_state = random_state
+        self.score_thresholds = {**SCORE_THRESHOLDS, **(score_thresholds or {})}
         self.scalers = {}
 
     def prepare_data(self, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
@@ -152,7 +173,8 @@ class TimeSeriesDataProcessor:
         elif self.task == 'vasopressor':
             X, y = self._prepare_vasopressor_data(df)
         elif self.task in ('sofa_score', 'sirs_score', 'news2_score'):
-            X, y = self._prepare_score_regression_data(df, self.task)
+            threshold = self.score_thresholds[self.task]
+            X, y = self._prepare_score_threshold_data(df, self.task, threshold)
         else:
             raise ValueError(f"Unknown task type: {self.task}")
 
@@ -352,26 +374,34 @@ class TimeSeriesDataProcessor:
         
         return np.array(features), np.array(targets)
     
-    def _prepare_score_regression_data(
+    def _prepare_score_threshold_data(
         self,
         df: pd.DataFrame,
         score_col: str,
+        threshold: int,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """Sliding-window regression: predict the mean future score value.
+        """Sliding-window binary classification: predict threshold exceedance.
 
-        Uses the same window/horizon mechanism as the septic-shock task but
-        returns a continuous float target (mean score over the future horizon)
-        rather than a binary onset flag.
+        For each sliding window of ``window_size`` timesteps the target is:
+            y = 1  if ANY timestep in the next ``prediction_horizon`` steps
+                   has ``score_col`` >= ``threshold``
+            y = 0  otherwise
+
+        This produces a continuous probability P(threshold exceeded) when any
+        probabilistic classifier is applied, and a hard binary prediction when
+        the probability is thresholded at 0.5 (or a custom decision_threshold).
 
         Parameters
         ----------
         df : pd.DataFrame
         score_col : str
             One of 'sofa_score', 'sirs_score', 'news2_score'.
+        threshold : int
+            Clinical exceedance threshold (e.g. 2 for SOFA, 5 for NEWS2).
         """
         if self.prediction_horizon is None:
             raise ValueError(
-                f"prediction_horizon must be set for score regression task '{score_col}'"
+                f"prediction_horizon must be set for score threshold task '{score_col}'"
             )
         if score_col not in df.columns:
             raise ValueError(f"Score column '{score_col}' not found in DataFrame.")
@@ -379,7 +409,8 @@ class TimeSeriesDataProcessor:
         grouped = df.groupby('stay_id')
         features, targets = [], []
 
-        print(f"Processing {score_col} regression data...")
+        print(f"Processing {score_col} threshold-exceedance data "
+              f"(threshold={threshold}, H={self.prediction_horizon})...")
         bar = pyprind.ProgBar(len(grouped))
         for _, group in grouped:
             group = group.sort_values('timestep')
@@ -393,12 +424,12 @@ class TimeSeriesDataProcessor:
                         i + self.window_size:
                         i + self.window_size + self.prediction_horizon
                     ]
-                    # Use mean future score as regression target (robust to outlier steps)
-                    future_score = future_window[score_col].mean()
-                    targets.append(future_score)
+                    # Binary label: 1 if score exceeds threshold in any future step
+                    exceeds = int(future_window[score_col].max() >= threshold)
+                    targets.append(exceeds)
             bar.update()
 
-        return np.array(features), np.array(targets, dtype=np.float32)
+        return np.array(features), np.array(targets, dtype=np.int8)
 
     def _prepare_score_multistep_data(
         self,
@@ -522,7 +553,9 @@ class TimeSeriesDataProcessor:
         """
         rng = np.random.default_rng(self.random_state)
 
-        regression_tasks = {'sofa_score', 'sirs_score', 'news2_score', 'los'}
+        # Score tasks are now binary classification (threshold exceedance).
+        # Only 'los' remains a true regression task in the single-step path.
+        regression_tasks = {'los'}
         is_regression = self.task in regression_tasks
 
         n_windows = len(targets)
