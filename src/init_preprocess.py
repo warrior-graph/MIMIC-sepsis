@@ -248,15 +248,28 @@ def main():
     # Find infection onset
     onset = find_infection_onset(icustayidlist, data['abx'], bacterio)
 
+    # Build non_onset: all demog stays NOT found in onset, time anchor = intime + 24 h
+    onset_stay_ids = set(onset['stay_id'].tolist())
+    non_onset = (
+        demog.loc[~demog['stay_id'].isin(onset_stay_ids), ['subject_id', 'stay_id', 'intime']]
+        .copy()
+    )
+    # onset_time in seconds-since-epoch, same convention used in format_traj
+    non_onset['onset_time'] = non_onset['intime'] + 24 * 3600
+    non_onset = non_onset[['subject_id', 'stay_id', 'onset_time']].reset_index(drop=True)
+    print(f'  onset patients  : {len(onset)}')
+    print(f'  non-onset patients (controls): {len(non_onset)}')
+
     # Save processed data if requested
     if args.save_intermediate:
         onset.to_csv('processed_files/onset.csv', sep='|', index=False)
+        non_onset.to_csv('processed_files/non_onset.csv', sep='|', index=False)
         bacterio.to_csv('processed_files/bacterio_processed.csv', sep='|', index=False)
         demog.to_csv('processed_files/demog_processed.csv', sep='|', index=False)
         data['labU'].to_csv('processed_files/labu.csv', sep='|', index=False)
         data['abx'].to_csv('processed_files/abx_processed.csv', sep='|', index=False)
 
-    return onset, bacterio, demog, data
+    return onset, non_onset, bacterio, demog, data
 
 
 if __name__ == "__main__":

@@ -60,6 +60,8 @@ def parse_args():
                         help="If specified, also write a class-balanced version of the output CSV")
     parser.add_argument("--noise_ratio", type=float, default=0.10,
                         help="Fraction of non-scoring patients to inject as noise relative to primary cohort (default: 0.10)")
+    parser.add_argument("--non_onset_cap", type=int, default=None,
+                        help="Max number of non-onset (control) patients to include (default: None = all)")
     return parser.parse_args()
 
 
@@ -114,7 +116,8 @@ def load_processed_files():
         'vaso': 'vaso.csv',
         'UO': 'uo.csv',
         'labU': 'labu.csv',
-        'onset': 'onset.csv'
+        'onset': 'onset.csv',
+        'non_onset': 'non_onset.csv',
     }
 
     data = {}
@@ -1260,6 +1263,15 @@ def main():
         print(f'Sampling {args.sample_size} subjects for testing')
         onset = onset.sample(n=args.sample_size, random_state=42)
 
+    # Load non-onset (control) patients
+    non_onset = data['non_onset']
+    if args.non_onset_cap is not None:
+        non_onset = non_onset.sample(
+            n=min(args.non_onset_cap, len(non_onset)), random_state=42
+        )
+    print(f'  onset patients        : {len(onset)}')
+    print(f'  non-onset patients    : {len(non_onset)}')
+
     # Pre-index data by stay_id
     print('Pre-indexing data by stay_id...')
     data_indexed = {
@@ -1268,30 +1280,37 @@ def main():
         'MV_groups': dict(list(data['MV'].groupby('stay_id'))),
     }
 
-    # Process each patient
-    print('Processing patient timeseries data')
-    all_patient_data = []
+    def _process_cohort_gpu(cohort_df, label):
+        """Process a cohort (onset or non-onset) through the measurement pipeline."""
+        patient_data = []
+        count = 0
+        total = len(cohort_df)
+        print(f'Processing {label} timeseries data ({total} patients)')
+        for _, row in cohort_df.iterrows():
+            count += 1
+            if count % 500 == 0:
+                print(f'  Processed {count}/{total} {label} patients')
+            icustayid = row['stay_id']
+            onset_time = row['onset_time']
+            if onset_time > 0:
+                patient_df = process_patient_measurements_fast(
+                    data_indexed, code_to_concept,
+                    icustayid, onset_time,
+                    winb4=args.window_before,
+                    winaft=args.window_after
+                )
+                if patient_df is not None:
+                    patient_data.append(patient_df)
+        return patient_data
 
-    count = 0
-    total = len(onset)
-    for _, row in onset.iterrows():
-        count += 1
-        if count % 500 == 0:
-            print(f'  Processed {count}/{total} patients')
+    # Process onset (infected) patients
+    onset_data = _process_cohort_gpu(onset, 'onset')
 
-        icustayid = row['stay_id']
-        onset_time = row['onset_time']
-        if onset_time > 0:
-            patient_df = process_patient_measurements_fast(
-                data_indexed, code_to_concept,
-                icustayid, onset_time,
-                winb4=args.window_before,
-                winaft=args.window_after
-            )
-            if patient_df is not None:
-                all_patient_data.append(patient_df)
+    # Process non-onset (control) patients through identical pipeline
+    non_onset_data = _process_cohort_gpu(non_onset, 'non-onset')
 
-    init_traj = pd.concat(all_patient_data, ignore_index=True)
+    init_traj = pd.concat(onset_data + non_onset_data, ignore_index=True)
+    print(f'  Combined cohort: {init_traj["stay_id"].nunique()} patients, {len(init_traj)} rows')
 
     # Pipeline
     init_traj = handle_outliers(init_traj)

@@ -1,5 +1,46 @@
 # Plan: Multi-Score Prediction with Balanced Database
 
+> **Last updated:** Root cause of near-100 % risk-score rates identified and fixed (2026-06-12).
+> See **Root Cause & Fix** section below.
+
+---
+
+## Root Cause & Fix (Added 2026-06-12)
+
+### Problem
+
+Running the pipeline with any `--noise_ratio` value (including 0.20) still produced:
+
+```
+sofa_risk   100.0 %
+news2_risk   98.3 %
+sirs_risk    88.3 %
+sepsis_flag  99.4 %
+```
+
+**Root cause:** [`init_preprocess.py find_infection_onset()`](src/init_preprocess.py:160) outputs
+`onset.csv` which contains **only patients who satisfied the Sepsis-3 ABx + culture criterion**.
+All three `format_traj*.py` pipelines then iterate exclusively over `onset.csv`, meaning the
+entire processed dataset is pre-selected infected patients. The `ineligible_stays` pool inside
+[`apply_exclusion_criteria()`](src/format_traj.py:1003) is therefore near-empty regardless of
+`noise_ratio`, so no real negative examples can be injected.
+
+### Fix (implemented)
+
+| File | Change |
+|------|--------|
+| [`src/init_preprocess.py`](src/init_preprocess.py) | After `find_infection_onset()`, compute the complement set from `demog` and save `non_onset.csv` (time anchor = `intime + 24 h`). Return value updated to include `non_onset`. |
+| [`src/format_traj.py`](src/format_traj.py) | `load_processed_files()` loads `non_onset.csv`. `parse_args()` gains `--non_onset_cap`. `main()` processes both onset and non-onset cohorts through the identical measurement pipeline and concatenates before `apply_exclusion_criteria()`. |
+| [`src/format_traj_polars.py`](src/format_traj_polars.py) | Same three changes as `format_traj.py`. |
+| [`src/format_traj_gpu.py`](src/format_traj_gpu.py) | Same three changes as `format_traj.py`. |
+
+After the fix:
+- `ineligible_stays` pool contains ~55 k genuine control patients
+- `apply_exclusion_criteria()` + `noise_ratio` operate as designed
+- Score risk percentages will reflect true clinical prevalence (~30–60 % depending on threshold)
+
+---
+
 ## Goal
 
 Extend the MIMIC-sepsis pipeline so the processed dataset can be used to predict **SOFA**, **SIRS**, and **NEWS2** scores—ensuring every parameter required by each score is retained, the patient cohort is no longer gated on SOFA alone, and the resulting dataset is balanced for ML training.
