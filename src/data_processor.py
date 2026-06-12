@@ -1,9 +1,39 @@
+import sys
+import time
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler
 from typing import Tuple, Dict, List, Optional
-import pyprind
 import warnings
+
+
+# ---------------------------------------------------------------------------
+# Lightweight progress bar — no external dependency, works in any environment
+# ---------------------------------------------------------------------------
+
+class _ProgressBar:
+    """Minimal tqdm-free progress bar that works in terminals and Jupyter."""
+
+    def __init__(self, total: int, width: int = 40):
+        self._total   = max(total, 1)
+        self._current = 0
+        self._width   = width
+        self._start   = time.time()
+        self._print()
+
+    def _print(self):
+        pct   = self._current / self._total
+        filled = int(self._width * pct)
+        bar   = '█' * filled + '░' * (self._width - filled)
+        elapsed = time.time() - self._start
+        print(f'\r  [{bar}] {self._current}/{self._total}  {elapsed:.1f}s',
+              end='', flush=True)
+
+    def update(self):
+        self._current = min(self._current + 1, self._total)
+        self._print()
+        if self._current >= self._total:
+            print()   # newline when done
 
 
 # ---------------------------------------------------------------------------
@@ -197,7 +227,7 @@ class TimeSeriesDataProcessor:
         features, targets = [], []
         
         print("Processing sepsis data...")
-        bar = pyprind.ProgBar(len(grouped))
+        bar = _ProgressBar(len(grouped))
         for _, group in grouped:
             # Sort by timestep to ensure temporal order
             group = group.sort_values('timestep')
@@ -215,9 +245,9 @@ class TimeSeriesDataProcessor:
                     targets.append(1 if sepsis_occurs else 0)
             bar.update()
         
-        return np.array(features), np.array(targets)
-    
-    
+        return np.array(features, dtype=np.float32), np.array(targets, dtype=np.int8)
+
+
     def _prepare_mortality_data(self, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
         """
         For mortality prediction:
@@ -228,7 +258,7 @@ class TimeSeriesDataProcessor:
         features, targets = [], []
         
         print("Processing mortality data...")
-        bar = pyprind.ProgBar(len(grouped))
+        bar = _ProgressBar(len(grouped))
         for _, group in grouped:
             window_data = group.head(self.window_size)[self.features].values
             if len(window_data) == self.window_size:  # Only use complete windows
@@ -236,8 +266,8 @@ class TimeSeriesDataProcessor:
                 targets.append(group[self.task].iloc[-1])
             bar.update()
         
-        return np.array(features), np.array(targets)
-    
+        return np.array(features, dtype=np.float32), np.array(targets, dtype=np.int8)
+
     def _prepare_los_data(self, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
         """
         For length of stay prediction:
@@ -252,7 +282,7 @@ class TimeSeriesDataProcessor:
         features, targets = [], []
         
         print("Processing length of stay data...")
-        bar = pyprind.ProgBar(len(grouped))
+        bar = _ProgressBar(len(grouped))
         for _, group in grouped:
             # Sort by timestep to ensure temporal order
             group = group.sort_values('timestep')
@@ -267,8 +297,8 @@ class TimeSeriesDataProcessor:
                     targets.append(total_los)
             bar.update()
         
-        return np.array(features), np.array(targets)
-    
+        return np.array(features, dtype=np.float32), np.array(targets, dtype=np.float32)
+
     def _prepare_mechvent_data(self, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
         """
         For mechanical ventilation prediction:
@@ -283,7 +313,7 @@ class TimeSeriesDataProcessor:
         features, targets = [], []
         
         print("Processing mechanical ventilation data...")
-        bar = pyprind.ProgBar(len(grouped))
+        bar = _ProgressBar(len(grouped))
         for _, group in grouped:
             # Sort by timestep to ensure temporal order
             group = group.sort_values('timestep')
@@ -301,8 +331,8 @@ class TimeSeriesDataProcessor:
                     targets.append(1 if vent_occurs else 0)
             bar.update()
         
-        return np.array(features), np.array(targets)
-    
+        return np.array(features, dtype=np.float32), np.array(targets, dtype=np.int8)
+
     def _prepare_septic_shock_data(self, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
         """
         For septic shock prediction:
@@ -317,7 +347,7 @@ class TimeSeriesDataProcessor:
         features, targets = [], []
         
         print("Processing septic shock data...")
-        bar = pyprind.ProgBar(len(grouped))
+        bar = _ProgressBar(len(grouped))
         for _, group in grouped:
             # Sort by timestep to ensure temporal order
             group = group.sort_values('timestep')
@@ -335,8 +365,8 @@ class TimeSeriesDataProcessor:
                     targets.append(1 if shock_occurs else 0)
             bar.update()
         
-        return np.array(features), np.array(targets)
-    
+        return np.array(features, dtype=np.float32), np.array(targets, dtype=np.int8)
+
     def _prepare_vasopressor_data(self, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
         """
         For vasopressor requirement prediction:
@@ -352,7 +382,7 @@ class TimeSeriesDataProcessor:
         features, targets = [], []
         
         print("Processing vasopressor requirement data...")
-        bar = pyprind.ProgBar(len(grouped))
+        bar = _ProgressBar(len(grouped))
         for _, group in grouped:
             # Sort by timestep to ensure temporal order
             group = group.sort_values('timestep')
@@ -372,8 +402,8 @@ class TimeSeriesDataProcessor:
                     targets.append(1 if vaso_required else 0)
             bar.update()
         
-        return np.array(features), np.array(targets)
-    
+        return np.array(features, dtype=np.float32), np.array(targets, dtype=np.int8)
+
     def _prepare_score_threshold_data(
         self,
         df: pd.DataFrame,
@@ -411,7 +441,7 @@ class TimeSeriesDataProcessor:
 
         print(f"Processing {score_col} threshold-exceedance data "
               f"(threshold={threshold}, H={self.prediction_horizon})...")
-        bar = pyprind.ProgBar(len(grouped))
+        bar = _ProgressBar(len(grouped))
         for _, group in grouped:
             group = group.sort_values('timestep')
 
@@ -429,7 +459,7 @@ class TimeSeriesDataProcessor:
                     targets.append(exceeds)
             bar.update()
 
-        return np.array(features), np.array(targets, dtype=np.int8)
+        return np.array(features, dtype=np.float32), np.array(targets, dtype=np.int8)
 
     def _prepare_score_multistep_data(
         self,
@@ -464,7 +494,7 @@ class TimeSeriesDataProcessor:
         features, targets = [], []
 
         print(f"Processing {score_col} multistep data (H={self.prediction_horizon})...")
-        bar = pyprind.ProgBar(len(grouped))
+        bar = _ProgressBar(len(grouped))
         for _, group in grouped:
             group = group.sort_values('timestep')
 
@@ -488,7 +518,7 @@ class TimeSeriesDataProcessor:
                         targets.append(padded)
             bar.update()
 
-        return np.array(features), np.array(targets, dtype=np.float32)
+        return np.array(features, dtype=np.float32), np.array(targets, dtype=np.float32)
 
     def prepare_multistep_data(self, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
         """Public entry point for multi-step score prediction.

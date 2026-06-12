@@ -1,4 +1,5 @@
 import argparse
+import gc
 import pandas as pd
 import numpy as np
 from datetime import datetime
@@ -37,9 +38,21 @@ def set_random_seeds(seed=42):
 
 
 def load_data(data_path: str) -> pd.DataFrame:
-    """Load the patient timeseries data"""
+    """Load the patient timeseries data with memory-efficient dtypes.
+
+    Reads the CSV and immediately downcasts float64→float32 and int64→int32
+    to roughly halve memory consumption before any processing begins.
+    """
     print("Loading patient timeseries data...")
-    return pd.read_csv(data_path)
+    df = pd.read_csv(data_path)
+    for col in df.select_dtypes('float64').columns:
+        df[col] = df[col].astype('float32')
+    for col in df.select_dtypes('int64').columns:
+        df[col] = df[col].astype('int32')
+    mem_mb = df.memory_usage(deep=True).sum() / 1024 ** 2
+    print(f"  Loaded {len(df):,} rows, {df['stay_id'].nunique():,} patients "
+          f"— {mem_mb:.0f} MB in RAM (float32/int32)")
+    return df
 
 def get_feature_columns(df: pd.DataFrame, target_col: str) -> list:
     """Get feature columns by excluding specific columns"""
@@ -279,9 +292,11 @@ def run_benchmark(task: str, model_type: str, include_treatments: bool = True,
     )
 
     
-    # Split data
+    # Split data — then immediately free the full DataFrame
     train_df, val_df = split_data(df)
-    
+    del df
+    gc.collect()
+
     # Process and normalize data
     print("\nProcessing data...")
     train_features, train_targets = processor.prepare_data(train_df)
