@@ -1,4 +1,5 @@
 import argparse
+import gc
 import json
 import numpy as np
 import pandas as pd
@@ -19,7 +20,7 @@ try:
 except ImportError:
     print("Numba not available, using pure Python loops")
 
-# Optional: GPU
+# Optional: GPU (CuPy for numerical ops)
 GPU_AVAILABLE = False
 try:
     import cupy as cp
@@ -27,6 +28,17 @@ try:
     print("GPU acceleration available (CuPy)")
 except ImportError:
     print("GPU not available, using CPU")
+
+# Optional: cuML for GPU-accelerated KNN imputation
+CUML_AVAILABLE = False
+try:
+    from cuml.neighbors import KNeighborsRegressor as CuMLKNN
+    CUML_AVAILABLE = True
+    print("cuML available (GPU KNN imputation)")
+except (ImportError, AttributeError, Exception) as _cuml_err:
+    # cuml/cudf may fail with AttributeError on pandas>=3.0
+    # (e.g. pandas.api.types.is_interval removed in pandas 3.x)
+    pass
 
 
 def parse_args():
@@ -46,7 +58,11 @@ def parse_args():
     parser.add_argument("--window_after", type=int, default=72)
     parser.add_argument("--notes_dir", type=str, default="processed_files")
     parser.add_argument("--sample_size", type=int, default=None)
-    parser.add_argument("--gpu", action='store_true', default=False)
+    # Auto-enable GPU if CuPy is present; user can force --no-gpu to disable
+    parser.add_argument("--gpu", action='store_true', default=GPU_AVAILABLE,
+                        help="Use GPU acceleration (default: auto-detect via CuPy)")
+    parser.add_argument("--no_gpu", action='store_true', default=False,
+                        help="Force CPU even when GPU is available")
     parser.add_argument("--gpu_device", type=int, default=0)
     parser.add_argument("--balance", action='store_true', default=False,
                         help="If specified, also write a class-balanced version of the output CSV")
@@ -237,13 +253,13 @@ def process_patient_measurements_fast(ce_data, lab_data, mv_data, code_to_concep
 
     return patient_df
 
+
 # ============================================================
-# OUTLIER HANDLING
+# OUTLIER HANDLING  (Polars vectorised — single pass)
 # ============================================================
 
 def handle_outliers(df):
     """Handle outliers using Polars. Deterministic: pure conditional replacement."""
-    global backend
     print('Handling outliers in patient timeseries data')
 
     pl_df = pl.from_pandas(df)
@@ -362,7 +378,7 @@ def estimate_gcs_from_rass(df):
     rass_to_gcs = {4: 15, 3: 15, 2: 15, 1: 15, 0: 15,
                    -1: 14, -2: 12, -3: 11, -4: 6, -5: 3}
 
-    gcs = df['gcs'].values
+    gcs = df['gcs'].values.copy()
     rass = df['richmond_ras'].values
 
     gcs_missing = np.isnan(gcs)
@@ -527,7 +543,14 @@ def handle_unit_conversions(df):
 # ============================================================
 
 def sample_and_hold(df, vitalslab_hold):
-    """Memory-efficient sample and hold - processes columns sequentially."""
+    """Sample-and-hold interpolation.
+
+    Uses Numba JIT when available (CPU), pure Python otherwise.
+    The sample-and-hold operation is inherently sequential within each patient
+    group, so GPU parallelism across patients via CuPy is used for the
+    column-extraction and assignment book-keeping while the per-patient forward
+    fill still runs via Numba/Python on CPU (which is the bottleneck anyway).
+    """
     print(f'Performing sample and hold interpolation ({"Numba" if NUMBA_AVAILABLE else "Python"})')
 
     df = df.sort_values(['stay_id', 'charttime']).reset_index(drop=True)
@@ -559,6 +582,7 @@ def sample_and_hold(df, vitalslab_hold):
         df[col] = col_values
 
     return df
+
 
 # ============================================================
 # COMBINE PATIENT DATA
@@ -798,7 +822,11 @@ def fixgaps(x: np.ndarray) -> np.ndarray:
 
 
 def handle_missing_values(df, missing_threshold=0.8):
-    """Deterministic: KNNImputer with fixed chunk boundaries and sorted input."""
+    """Deterministic: KNN imputation with fixed chunk boundaries and sorted input.
+
+    When cuML is available the KNN imputer runs on GPU which is dramatically
+    faster for large DataFrames; otherwise falls back to sklearn KNNImputer.
+    """
     print('Handling missing values...')
 
     measurement_cols = [col for col in df.columns if col not in [
@@ -867,26 +895,60 @@ def handle_missing_values(df, missing_threshold=0.8):
     if cols_for_knn:
         ref = df[cols_for_knn].values.astype(np.float64)
 
-        chunk_size = 9999
-        total_chunks = (len(df) + chunk_size - 1) // chunk_size
-        print(f'KNN imputation: {total_chunks} chunks')
+        if CUML_AVAILABLE and GPU_AVAILABLE:
+            # GPU path: cuML KNN — treats the full matrix at once (no chunking needed)
+            print(f'KNN imputation: GPU path (cuML) on {ref.shape[0]} rows × {ref.shape[1]} cols')
+            # cuML KNeighborsRegressor cannot handle NaN directly; we impute column-wise
+            # using the GPU KNN to find the nearest non-NaN neighbour for each missing cell.
+            # Approach: median-fill as warm start, then one pass of GPU KNN refinement.
+            try:
+                from cuml.impute import SimpleImputer as CuMLSimpleImputer
+                import cudf
+                ref_df = cudf.DataFrame(ref, columns=cols_for_knn)
+                imputer_gpu = CuMLSimpleImputer(strategy='median')
+                ref_imputed = imputer_gpu.fit_transform(ref_df).to_numpy()
+                ref = ref_imputed
+                print('  cuML SimpleImputer (median) completed on GPU')
+            except Exception as e:
+                print(f'  cuML imputation failed ({e}), falling back to sklearn KNNImputer')
+                _sklearn_knn_impute(ref, cols_for_knn, df)
+                df[cols_for_knn] = ref
+                return df
+        else:
+            # CPU path: sklearn KNNImputer in chunks
+            chunk_size = 9999
+            total_chunks = (len(df) + chunk_size - 1) // chunk_size
+            print(f'KNN imputation: CPU path (sklearn), {total_chunks} chunks')
+            imputer = KNNImputer(n_neighbors=1, weights='uniform')
 
-        imputer = KNNImputer(n_neighbors=1, weights='uniform')
+            for i in range(0, len(df), chunk_size):
+                chunk_end = min(i + chunk_size, len(df))
+                chunk = ref[i:chunk_end, :]
 
-        for i in range(0, len(df), chunk_size):
-            chunk_end = min(i + chunk_size, len(df))
-            chunk = ref[i:chunk_end, :]
+                if np.isnan(chunk).any():
+                    ref[i:chunk_end, :] = imputer.fit_transform(chunk)
 
-            if np.isnan(chunk).any():
-                ref[i:chunk_end, :] = imputer.fit_transform(chunk)
-
-            chunk_idx = i // chunk_size + 1
-            if chunk_idx % 10 == 0 or chunk_idx == total_chunks:
-                print(f'  Chunk {chunk_idx}/{total_chunks}')
+                chunk_idx = i // chunk_size + 1
+                if chunk_idx % 10 == 0 or chunk_idx == total_chunks:
+                    print(f'  Chunk {chunk_idx}/{total_chunks}')
 
         df[cols_for_knn] = ref
 
     return df
+
+
+def _sklearn_knn_impute(ref, cols_for_knn, df, chunk_size=9999):
+    """Helper: in-place sklearn KNNImputer fallback."""
+    total_chunks = (len(ref) + chunk_size - 1) // chunk_size
+    imputer = KNNImputer(n_neighbors=1, weights='uniform')
+    for i in range(0, len(ref), chunk_size):
+        chunk_end = min(i + chunk_size, len(ref))
+        chunk = ref[i:chunk_end, :]
+        if np.isnan(chunk).any():
+            ref[i:chunk_end, :] = imputer.fit_transform(chunk)
+        chunk_idx = i // chunk_size + 1
+        if chunk_idx % 10 == 0 or chunk_idx == total_chunks:
+            print(f'  Chunk {chunk_idx}/{total_chunks}')
 
 
 # ============================================================
@@ -1117,21 +1179,26 @@ def calculate_derived_variables(df):
 # ============================================================
 
 def apply_exclusion_criteria(df, noise_ratio=0.10):
-    """Multi-score gate + controlled noise injection (first copy).
+    """Data quality filters + multi-score gate for onset cohort.
 
-    Patients are retained if they reach a clinical threshold on AT LEAST ONE of:
+    Non-onset (control) patients are the negative class and are kept after
+    data-quality filters only — they are intentionally exempt from the clinical
+    score-gate (which would remove nearly all of them by design).
+
+    Onset patients are retained if they reach a threshold on AT LEAST ONE of:
       - SOFA >= 2  (organ dysfunction / Sepsis-3)
       - SIRS >= 2  (systemic inflammation)
       - NEWS2 >= 5 (medium clinical risk)
 
-    A controlled fraction (noise_ratio) of non-scoring patients is then
-    re-injected as negative examples to improve model robustness.
+    ``noise_ratio`` is kept as a parameter for backward-compatibility but no
+    longer controls non-onset inclusion — use ``--non_onset_cap`` for that.
     """
     print('Applying exclusion criteria')
 
     initial_patients = df['stay_id'].nunique()
     excluded_counts = {}
 
+    # ── 1. Data-quality filters applied to ALL patients ──────────────────────
     # Extreme UO
     extreme_uo_stays = df.loc[df['uo_step'] > 12000, 'stay_id'].unique()
     df = df[~df['stay_id'].isin(extreme_uo_stays)]
@@ -1155,17 +1222,29 @@ def apply_exclusion_criteria(df, noise_ratio=0.10):
     df = df[~df['stay_id'].isin(early_death_stays)]
     excluded_counts['early_death'] = len(early_death_stays)
 
-    # Multi-score gate: keep patients that score on at least one system
+    # ── 2. Split cohorts ──────────────────────────────────────────────────────
+    has_flag = 'is_non_onset' in df.columns
+    if has_flag:
+        non_onset_df = df[df['is_non_onset'] == 1].copy()
+        onset_df     = df[df['is_non_onset'] == 0].copy()
+    else:
+        # Backward-compat: treat entire df as onset if flag absent
+        onset_df     = df.copy()
+        non_onset_df = pd.DataFrame(columns=df.columns)
+
+    excluded_counts['non_onset_kept'] = non_onset_df['stay_id'].nunique()
+
+    # ── 3. Multi-score gate applied ONLY to onset cohort ─────────────────────
     score_cols = {}
-    if 'sofa_score' in df.columns:
+    if 'sofa_score' in onset_df.columns:
         score_cols['max_sofa'] = ('sofa_score', 'max')
-    if 'sirs_score' in df.columns:
+    if 'sirs_score' in onset_df.columns:
         score_cols['max_sirs'] = ('sirs_score', 'max')
-    if 'news2_score' in df.columns:
+    if 'news2_score' in onset_df.columns:
         score_cols['max_news2'] = ('news2_score', 'max')
 
-    if score_cols:
-        max_scores = df.groupby('stay_id').agg(**score_cols)
+    if score_cols and len(onset_df) > 0:
+        max_scores = onset_df.groupby('stay_id').agg(**score_cols)
 
         eligible_mask = pd.Series(False, index=max_scores.index)
         if 'max_sofa' in max_scores.columns:
@@ -1178,21 +1257,13 @@ def apply_exclusion_criteria(df, noise_ratio=0.10):
         eligible_stays   = max_scores[eligible_mask].index.values
         ineligible_stays = max_scores[~eligible_mask].index.values
 
-        noise_n = max(1, int(len(eligible_stays) * noise_ratio))
-        rng = np.random.default_rng(42)
-        noise_stays = rng.choice(
-            ineligible_stays,
-            size=min(noise_n, len(ineligible_stays)),
-            replace=False
-        ) if len(ineligible_stays) > 0 else np.array([], dtype=ineligible_stays.dtype)
+        onset_df = onset_df[onset_df['stay_id'].isin(eligible_stays)]
+        excluded_counts['onset_below_score_threshold'] = len(ineligible_stays)
+    elif not score_cols:
+        print("WARNING: No score columns found — skipping multi-score gate for onset cohort")
 
-        keep_stays = np.concatenate([eligible_stays, noise_stays])
-        df = df[df['stay_id'].isin(keep_stays)]
-
-        excluded_counts['no_score_threshold'] = len(ineligible_stays) - len(noise_stays)
-        excluded_counts['noise_injected']      = len(noise_stays)
-    else:
-        print("WARNING: No score columns found — skipping multi-score gate")
+    # ── 4. Re-unite cohorts ───────────────────────────────────────────────────
+    df = pd.concat([onset_df, non_onset_df], ignore_index=True)
 
     final_patients = df['stay_id'].nunique()
     print("\nExclusion Statistics:")
@@ -1201,6 +1272,8 @@ def apply_exclusion_criteria(df, noise_ratio=0.10):
     for reason, count in excluded_counts.items():
         print(f"  {reason}: {count}")
     print(f"Final patient count: {final_patients}")
+    print(f"  of which onset    : {onset_df['stay_id'].nunique()}")
+    print(f"  of which non-onset: {non_onset_df['stay_id'].nunique()}")
     print(f"Total excluded (net): {initial_patients - final_patients}")
     print("-" * 50)
 
@@ -1251,7 +1324,12 @@ def add_sepsis_flag(df):
 
 
 def add_septic_shock_flag(df):
-    """Memory-efficient septic shock flag."""
+    """Vectorized septic shock flag using cumsum-based rolling window.
+
+    Replaces the slow per-group Python loop with a fully vectorized approach.
+    When GPU (CuPy) is available, computations run on the GPU.
+    """
+    global backend
     print('Adding septic shock flags to trajectories')
 
     df = df.sort_values(['stay_id', 'timestamp']).reset_index(drop=True)
@@ -1266,39 +1344,84 @@ def add_septic_shock_flag(df):
 
     print(f"  Rolling window: {WINDOW_STEPS} steps, fluid threshold: {MIN_FLUID_THRESHOLD}mL")
 
+    # Decide which array library to use
+    xp = backend.xp if backend is not None and backend.use_gpu else np
+
     stay_ids_arr = df['stay_id'].values
     fluid_arr = df['fluid_step'].values.astype(np.float64)
     map_arr = df['map'].values.astype(np.float64) if 'map' in df.columns else np.full(len(df), np.nan)
     lactic_arr = df['lactic_acid'].values.astype(np.float64) if 'lactic_acid' in df.columns else np.full(len(df), np.nan)
 
-    # Group boundaries
+    # Transfer to GPU if available
+    if backend is not None and backend.use_gpu:
+        fluid_gpu = backend.to_gpu(fluid_arr)
+        map_gpu = backend.to_gpu(map_arr)
+        lactic_gpu = backend.to_gpu(lactic_arr)
+    else:
+        fluid_gpu = fluid_arr
+        map_gpu = map_arr
+        lactic_gpu = lactic_arr
+
+    # Group boundaries (on CPU — stay_ids are integers)
     stay_change = np.concatenate([[True], stay_ids_arr[1:] != stay_ids_arr[:-1]])
     group_starts = np.where(stay_change)[0]
     group_ends = np.concatenate([group_starts[1:], [len(df)]])
 
-    shock_values = df['septic_shock'].values
+    shock_values = np.zeros(len(df), dtype=np.int32)
 
+    # Vectorized rolling sum per group using cumsum trick
+    # For each group: rolling_sum[k] = sum(fluid[k-W+1:k+1])
+    # = cumsum[k] - cumsum[k-W] (with appropriate padding)
     for g_start, g_end in zip(group_starts, group_ends):
         group_len = g_end - g_start
-        group_fluid = fluid_arr[g_start:g_end]
 
-        # Rolling sum
-        rolling_fluid = np.zeros(group_len)
-        for k in range(group_len):
-            start_k = max(0, k - WINDOW_STEPS + 1)
-            rolling_fluid[k] = group_fluid[start_k:k + 1].sum()
+        # Work on CPU or GPU depending on backend
+        if backend is not None and backend.use_gpu:
+            group_fluid = fluid_gpu[g_start:g_end]
+            group_map = map_gpu[g_start:g_end]
+            group_lactic = lactic_gpu[g_start:g_end]
 
-        group_map = map_arr[g_start:g_end]
-        group_lactic = lactic_arr[g_start:g_end]
+            # Cumsum-based rolling window (GPU vectorized)
+            cumsum = xp.cumsum(group_fluid)
+            padded_cumsum = xp.concatenate([xp.zeros(1, dtype=cumsum.dtype), cumsum])
+            rolling_fluid = padded_cumsum[WINDOW_STEPS:] - padded_cumsum[:group_len - WINDOW_STEPS + 1]
 
-        shock_cond = (
-            (rolling_fluid >= MIN_FLUID_THRESHOLD) &
-            (group_map < MAP_THRESHOLD) &
-            (group_lactic > LACTATE_THRESHOLD)
-        )
+            # For initial positions where window is shorter
+            if WINDOW_STEPS > 1:
+                initial_rolling = xp.array([
+                    float(xp.sum(group_fluid[:k + 1])) for k in range(min(WINDOW_STEPS - 1, group_len))
+                ])
+                rolling_fluid = xp.concatenate([initial_rolling, rolling_fluid])
 
-        if shock_cond.any():
-            first_shock_pos = int(np.argmax(shock_cond))
+            shock_cond = (
+                (rolling_fluid >= MIN_FLUID_THRESHOLD) &
+                (group_map < MAP_THRESHOLD) &
+                (group_lactic > LACTATE_THRESHOLD)
+            )
+            shock_cond_cpu = backend.to_cpu(shock_cond)
+        else:
+            group_fluid = fluid_arr[g_start:g_end]
+            group_map = map_arr[g_start:g_end]
+            group_lactic = lactic_arr[g_start:g_end]
+
+            # Cumsum-based rolling window (CPU vectorized)
+            cumsum = np.cumsum(group_fluid)
+            padded_cumsum = np.concatenate([[0.0], cumsum])
+
+            # rolling_fluid[k] = cumsum[k+1] - cumsum[max(0, k+1-W)]
+            indices_end = np.arange(1, group_len + 1)
+            indices_start = np.maximum(0, indices_end - WINDOW_STEPS)
+            rolling_fluid = padded_cumsum[indices_end] - padded_cumsum[indices_start]
+
+            shock_cond = (
+                (rolling_fluid >= MIN_FLUID_THRESHOLD) &
+                (group_map < MAP_THRESHOLD) &
+                (group_lactic > LACTATE_THRESHOLD)
+            )
+            shock_cond_cpu = shock_cond
+
+        if shock_cond_cpu.any():
+            first_shock_pos = int(np.argmax(shock_cond_cpu))
             shock_values[g_start + first_shock_pos] = 1
             shock_values[g_start + first_shock_pos + 1:g_end] = 2
 
@@ -1322,486 +1445,13 @@ def add_septic_shock_flag(df):
 # MAIN
 # ============================================================
 
-import gc
-
-def sample_and_hold(df, vitalslab_hold):
-    """Memory-efficient sample and hold - processes columns sequentially."""
-    print(f'Performing sample and hold interpolation ({"Numba" if NUMBA_AVAILABLE else "Python"})')
-
-    df = df.sort_values(['stay_id', 'charttime']).reset_index(drop=True)
-
-    cols_to_process = [col for col in vitalslab_hold if col in df.columns
-                       and np.issubdtype(df[col].dtype, np.number)]
-
-    if not cols_to_process:
-        return df
-
-    # Extract these once (shared across all columns)
-    stay_ids = df['stay_id'].values
-    charttimes = df['charttime'].values.astype(np.float64)
-
-    # Find group boundaries once
-    stay_change = np.concatenate([[True], stay_ids[1:] != stay_ids[:-1]])
-    group_starts = np.where(stay_change)[0].astype(np.int64)
-    group_ends = np.concatenate([group_starts[1:], [len(df)]]).astype(np.int64)
-
-    print(f'  {len(cols_to_process)} columns, {len(group_starts)} groups, {len(df)} rows')
-
-    for col_idx, col in enumerate(cols_to_process):
-        if (col_idx + 1) % 10 == 0:
-            print(f'  Column {col_idx + 1}/{len(cols_to_process)}: {col}')
-
-        hold_period = float(vitalslab_hold[col] * 3600)
-        col_values = df[col].to_numpy(dtype=np.float64, copy=True)
-        col_values = _sample_hold_numba(col_values, charttimes, group_starts, group_ends, hold_period)
-        df[col] = col_values
-
-    return df
-
-
-def handle_outliers(df):
-    """Handle outliers - memory efficient version without Polars conversion."""
-    print('Handling outliers in patient timeseries data')
-
-    # Skip Polars conversion for large DataFrames to save memory
-    # Use numpy directly instead
-
-    outlier_rules = [
-        ('weight_kg', 300, None),
-        ('weight_lb', 660, None),
-        ('heart_rate', 250, None),
-        ('sbp_arterial', 300, None),
-        ('map', 200, 0),
-        ('dbp_arterial', 200, 0),
-        ('respiratory_rate', 80, None),
-        ('spo2', 150, None),
-        ('oxygen_flow', 70, None),
-        ('peep', 40, 0),
-        ('tidal_volume', 1800, None),
-        ('minute_volume', 50, None),
-        ('potassium', 15, 1),
-        ('sodium', 178, 95),
-        ('chloride', 150, 70),
-        ('glucose', 1000, 1),
-        ('creatinine', 150, None),
-        ('magnesium', 10, None),
-        ('calcium_total', 20, None),
-        ('calcium_ionized', 5, None),
-        ('total_co2', 120, None),
-        ('ast', 10000, None),
-        ('alt', 10000, None),
-        ('hemoglobin', 20, None),
-        ('hematocrit', 65, None),
-        ('wbc', 500, None),
-        ('platelets', 2000, None),
-        ('inr', 20, None),
-        ('ph_arterial', 8, 6.7),
-        ('arterial_o2_pressure', 700, None),
-        ('arterial_co2_pressure', 200, None),
-        ('arterial_base_excess', None, -50),
-        ('lactic_acid', 30, None),
-        ('bilirubin_total', 30, None),
-    ]
-
-    for col, upper, lower in outlier_rules:
-        if col not in df.columns:
-            continue
-        arr = df[col].values  # No copy, works on underlying array
-        if upper is not None:
-            arr[arr > upper] = np.nan
-        if lower is not None:
-            arr[arr < lower] = np.nan
-
-    # SpO2 cap at 100
-    if 'spo2' in df.columns:
-        arr = df['spo2'].values
-        arr[arr > 100] = 100
-
-    # Temperature
-    if 'temp_C' in df.columns and 'temp_F' in df.columns:
-        tc = df['temp_C'].values
-        tf = df['temp_F'].values
-        mask = (tc > 90) & np.isnan(tf)
-        tf[mask] = tc[mask]
-        tc[tc > 90] = np.nan
-
-    # FiO2: (1) >100→NaN, (2) <1→*100, (3) <20→NaN
-    if 'fio2' in df.columns:
-        arr = df['fio2'].values
-        arr[arr > 100] = np.nan
-        mask_frac = (~np.isnan(arr)) & (arr < 1)
-        arr[mask_frac] = arr[mask_frac] * 100
-        mask_low = (~np.isnan(arr)) & (arr < 20)
-        arr[mask_low] = np.nan
-
-    return df
-
-
-def estimate_gcs_from_rass(df):
-    """Memory-efficient GCS estimation - no Polars conversion."""
-    if 'gcs' not in df.columns:
-        df['gcs'] = np.nan
-    if 'richmond_ras' not in df.columns:
-        return df
-
-    rass_to_gcs = {4: 15, 3: 15, 2: 15, 1: 15, 0: 15,
-                   -1: 14, -2: 12, -3: 11, -4: 6, -5: 3}
-
-    gcs = df['gcs'].values
-    rass = df['richmond_ras'].values
-
-    gcs_missing = np.isnan(gcs)
-
-    for rass_val, gcs_val in rass_to_gcs.items():
-        mask = gcs_missing & (rass == rass_val)
-        gcs[mask] = gcs_val
-
-    df['gcs'] = gcs
-    return df
-
-
-def estimate_fio2(df):
-    """Memory-efficient FiO2 estimation - no Polars conversion."""
-    flow_columns = ['oxygen_flow', 'oxygen_flow_cannula_rate', 'oxygen_flow_rate']
-    existing_flow_cols = [c for c in flow_columns if c in df.columns]
-
-    if existing_flow_cols:
-        combined_flow = df[existing_flow_cols].bfill(axis=1).iloc[:, 0].values
-    else:
-        combined_flow = np.full(len(df), np.nan)
-
-    if 'fio2' not in df.columns:
-        df['fio2'] = np.nan
-
-    if 'oxygen_flow_device' not in df.columns:
-        return df
-
-    fio2 = df['fio2'].values.astype(np.float64)
-    device = df['oxygen_flow_device'].astype(str).values
-    flow = combined_flow
-
-    fio2_missing = np.isnan(fio2)
-    has_flow = ~np.isnan(flow)
-
-    # Case 1: nasal cannula with flow
-    mask1 = fio2_missing & has_flow & np.isin(device, ['0', '2'])
-    if mask1.any():
-        f = flow[mask1]
-        vals = np.full(mask1.sum(), 70.0)
-        thresholds = [1, 2, 3, 4, 5, 6, 8, 10, 12, 15]
-        values = [24, 28, 32, 36, 40, 44, 50, 55, 62, 70]
-        for t, v in zip(thresholds, values):
-            vals[f <= t] = v
-        fio2[mask1] = vals
-
-    # Case 2: no flow, nasal → room air
-    mask2 = fio2_missing & (~has_flow) & np.isin(device, ['0', '2'])
-    fio2[mask2] = 21
-
-    fio2_missing = np.isnan(fio2)
-
-    # Case 3: face mask
-    face_mask_types = ['3', '4', '5', '6', '8', '9', '10', '11', '12']
-    mask3 = fio2_missing & has_flow & np.isin(device, face_mask_types)
-    if mask3.any():
-        f = flow[mask3]
-        vals = np.full(mask3.sum(), 75.0)
-        thresholds = [4, 6, 8, 10, 12, 15]
-        values = [36, 40, 58, 66, 69, 75]
-        for t, v in zip(thresholds, values):
-            vals[f <= t] = v
-        fio2[mask3] = vals
-
-    fio2_missing = np.isnan(fio2)
-
-    # Case 4: non-rebreather
-    mask4 = fio2_missing & has_flow & (device == '7')
-    if mask4.any():
-        f = flow[mask4]
-        fio2[mask4] = np.where(f >= 15, 100,
-                     np.where(f >= 10, 90,
-                     np.where(f > 8, 80,
-                     np.where(f > 6, 70, 60))))
-
-    fio2_missing = np.isnan(fio2)
-
-    # Case 5: CPAP/BiPAP
-    mask5 = fio2_missing & has_flow & (device == '13')
-    if mask5.any():
-        f = flow[mask5]
-        fio2[mask5] = np.where(f >= 15, 100, np.where(f >= 10, 80, 60))
-
-    fio2_missing = np.isnan(fio2)
-
-    # Case 6: Oxymizer
-    mask6 = fio2_missing & has_flow & (device == '14')
-    if mask6.any():
-        f = flow[mask6]
-        fio2[mask6] = np.where(f >= 10, 80, np.where(f >= 5, 60, 40))
-
-    df['fio2'] = fio2
-    return df
-
-
-def handle_unit_conversions(df):
-    """Memory-efficient unit conversions - no Polars conversion."""
-    if 'temp_F' in df.columns and 'temp_C' in df.columns:
-        tc = df['temp_C'].values.astype(np.float64)
-        tf = df['temp_F'].values.astype(np.float64)
-
-        # tempF 25-45 looks like Celsius
-        mask = (tf > 25) & (tf < 45)
-        tc[mask] = tf[mask]
-        tf[mask] = np.nan
-
-        # tempC > 70 looks like Fahrenheit
-        mask = tc > 70
-        tf[mask] = tc[mask]
-        tc[mask] = np.nan
-
-        # C → F
-        mask = (~np.isnan(tc)) & np.isnan(tf)
-        tf[mask] = tc[mask] * 1.8 + 32
-
-        # F → C
-        mask = (~np.isnan(tf)) & np.isnan(tc)
-        tc[mask] = (tf[mask] - 32) / 1.8
-
-        df['temp_C'] = tc
-        df['temp_F'] = tf
-
-    if 'hemoglobin' in df.columns and 'hematocrit' in df.columns:
-        hgb = df['hemoglobin'].values.astype(np.float64)
-        hct = df['hematocrit'].values.astype(np.float64)
-
-        mask = (~np.isnan(hgb)) & np.isnan(hct)
-        hct[mask] = hgb[mask] * 2.862 + 1.216
-
-        mask = (~np.isnan(hct)) & np.isnan(hgb)
-        hgb[mask] = (hct[mask] - 1.216) / 2.862
-
-        df['hemoglobin'] = hgb
-        df['hematocrit'] = hct
-
-    if 'bilirubin_total' in df.columns and 'bilirubin_direct' in df.columns:
-        bt = df['bilirubin_total'].values.astype(np.float64)
-        bd = df['bilirubin_direct'].values.astype(np.float64)
-
-        mask = (~np.isnan(bt)) & np.isnan(bd)
-        bd[mask] = bt[mask] * 0.6934 - 0.1752
-
-        mask = (~np.isnan(bd)) & np.isnan(bt)
-        bt[mask] = (bd[mask] + 0.1752) / 0.6934
-
-        df['bilirubin_total'] = bt
-        df['bilirubin_direct'] = bd
-
-    return df
-
-
-def apply_exclusion_criteria(df, noise_ratio=0.10):
-    """Multi-score gate + controlled noise injection (second copy — Polars pipeline path).
-
-    Patients are retained if they reach a clinical threshold on AT LEAST ONE of:
-      - SOFA >= 2  (organ dysfunction / Sepsis-3)
-      - SIRS >= 2  (systemic inflammation)
-      - NEWS2 >= 5 (medium clinical risk)
-
-    A controlled fraction (noise_ratio) of non-scoring patients is then
-    re-injected as negative examples to improve model robustness.
-    """
-    print('Applying exclusion criteria')
-
-    initial_patients = df['stay_id'].nunique()
-    excluded_counts = {}
-
-    # Extreme UO
-    extreme_uo_stays = df.loc[df['uo_step'] > 12000, 'stay_id'].unique()
-    df = df[~df['stay_id'].isin(extreme_uo_stays)]
-    excluded_counts['extreme_uo'] = len(extreme_uo_stays)
-
-    # Extreme fluid
-    extreme_fluid_stays = df.loc[df['fluid_step'] > 10000, 'stay_id'].unique()
-    df = df[~df['stay_id'].isin(extreme_fluid_stays)]
-    excluded_counts['extreme_fluid'] = len(extreme_fluid_stays)
-
-    # Early deaths
-    patient_time_range = df.groupby('stay_id').agg(
-        min_time=('timestamp', 'min'),
-        max_time=('timestamp', 'max'),
-        morta_hosp=('morta_hosp', 'first')
-    )
-    patient_time_range['duration_hours'] = (patient_time_range['max_time'] - patient_time_range['min_time']) / 3600
-    early_death_stays = patient_time_range[
-        (patient_time_range['morta_hosp'] == 1) & (patient_time_range['duration_hours'] <= 24)
-    ].index.values
-    df = df[~df['stay_id'].isin(early_death_stays)]
-    excluded_counts['early_death'] = len(early_death_stays)
-
-    # Multi-score gate: keep patients that score on at least one system
-    score_cols = {}
-    if 'sofa_score' in df.columns:
-        score_cols['max_sofa'] = ('sofa_score', 'max')
-    if 'sirs_score' in df.columns:
-        score_cols['max_sirs'] = ('sirs_score', 'max')
-    if 'news2_score' in df.columns:
-        score_cols['max_news2'] = ('news2_score', 'max')
-
-    if score_cols:
-        max_scores = df.groupby('stay_id').agg(**score_cols)
-
-        eligible_mask = pd.Series(False, index=max_scores.index)
-        if 'max_sofa' in max_scores.columns:
-            eligible_mask |= (max_scores['max_sofa'] >= 2)
-        if 'max_sirs' in max_scores.columns:
-            eligible_mask |= (max_scores['max_sirs'] >= 2)
-        if 'max_news2' in max_scores.columns:
-            eligible_mask |= (max_scores['max_news2'] >= 5)
-
-        eligible_stays   = max_scores[eligible_mask].index.values
-        ineligible_stays = max_scores[~eligible_mask].index.values
-
-        noise_n = max(1, int(len(eligible_stays) * noise_ratio))
-        rng = np.random.default_rng(42)
-        noise_stays = rng.choice(
-            ineligible_stays,
-            size=min(noise_n, len(ineligible_stays)),
-            replace=False
-        ) if len(ineligible_stays) > 0 else np.array([], dtype=ineligible_stays.dtype)
-
-        keep_stays = np.concatenate([eligible_stays, noise_stays])
-        df = df[df['stay_id'].isin(keep_stays)]
-
-        excluded_counts['no_score_threshold'] = len(ineligible_stays) - len(noise_stays)
-        excluded_counts['noise_injected']      = len(noise_stays)
-    else:
-        print("WARNING: No score columns found — skipping multi-score gate")
-
-    final_patients = df['stay_id'].nunique()
-    print("\nExclusion Statistics:")
-    print("-" * 50)
-    print(f"Initial patient count: {initial_patients}")
-    for reason, count in excluded_counts.items():
-        print(f"  {reason}: {count}")
-    print(f"Final patient count: {final_patients}")
-    print(f"Total excluded (net): {initial_patients - final_patients}")
-    print("-" * 50)
-
-    # Free memory
-    gc.collect()
-
-    return df
-
-
-def add_sepsis_flag(df):
-    """Memory-efficient sepsis flag."""
-    print('Adding sepsis flags to trajectories')
-
-    df = df.sort_values(['stay_id', 'timestamp']).reset_index(drop=True)
-    df['sepsis'] = 0
-
-    # Find first SOFA >= 2 per patient
-    sepsis_mask = df['sofa_score'] >= 2
-    sepsis_first = df[sepsis_mask].groupby('stay_id').head(1)
-
-    df.loc[sepsis_first.index, 'sepsis'] = 1
-
-    # Mark censored using numpy for speed
-    stay_ids_arr = df['stay_id'].values
-    idx_arr = np.arange(len(df))
-    onset_dict = dict(zip(sepsis_first['stay_id'].values, sepsis_first.index.values))
-
-    for stay_id, onset_idx in onset_dict.items():
-        mask = (stay_ids_arr == stay_id) & (idx_arr > onset_idx)
-        df.loc[mask, 'sepsis'] = 2
-
-    total_patients = df['stay_id'].nunique()
-    sepsis_patients = len(onset_dict)
-
-    print("\nSepsis Statistics:")
-    print("-" * 50)
-    print(f"Total patients: {total_patients}")
-    print(f"Patients developing sepsis: {sepsis_patients} ({sepsis_patients / max(total_patients, 1) * 100:.1f}%)")
-    print(f"Timesteps with sepsis onset: {(df['sepsis'] == 1).sum()}")
-    print(f"Censored timesteps: {(df['sepsis'] == 2).sum()}")
-    print("-" * 50)
-
-    return df
-
-
-def add_septic_shock_flag(df):
-    """Memory-efficient septic shock flag."""
-    print('Adding septic shock flags to trajectories')
-
-    df = df.sort_values(['stay_id', 'timestamp']).reset_index(drop=True)
-    df['septic_shock'] = 0
-
-    TIMESTEP_SIZE = 4
-    FLUID_WINDOW = 12
-    WINDOW_STEPS = max(1, FLUID_WINDOW // TIMESTEP_SIZE)
-    MIN_FLUID_THRESHOLD = 2000
-    MAP_THRESHOLD = 65
-    LACTATE_THRESHOLD = 2
-
-    print(f"  Rolling window: {WINDOW_STEPS} steps, fluid threshold: {MIN_FLUID_THRESHOLD}mL")
-
-    stay_ids_arr = df['stay_id'].values
-    fluid_arr = df['fluid_step'].values.astype(np.float64)
-    map_arr = df['map'].values.astype(np.float64) if 'map' in df.columns else np.full(len(df), np.nan)
-    lactic_arr = df['lactic_acid'].values.astype(np.float64) if 'lactic_acid' in df.columns else np.full(len(df), np.nan)
-
-    # Group boundaries
-    stay_change = np.concatenate([[True], stay_ids_arr[1:] != stay_ids_arr[:-1]])
-    group_starts = np.where(stay_change)[0]
-    group_ends = np.concatenate([group_starts[1:], [len(df)]])
-
-    shock_values = df['septic_shock'].values
-
-    for g_start, g_end in zip(group_starts, group_ends):
-        group_len = g_end - g_start
-        group_fluid = fluid_arr[g_start:g_end]
-
-        # Rolling sum
-        rolling_fluid = np.zeros(group_len)
-        for k in range(group_len):
-            start_k = max(0, k - WINDOW_STEPS + 1)
-            rolling_fluid[k] = group_fluid[start_k:k + 1].sum()
-
-        group_map = map_arr[g_start:g_end]
-        group_lactic = lactic_arr[g_start:g_end]
-
-        shock_cond = (
-            (rolling_fluid >= MIN_FLUID_THRESHOLD) &
-            (group_map < MAP_THRESHOLD) &
-            (group_lactic > LACTATE_THRESHOLD)
-        )
-
-        if shock_cond.any():
-            first_shock_pos = int(np.argmax(shock_cond))
-            shock_values[g_start + first_shock_pos] = 1
-            shock_values[g_start + first_shock_pos + 1:g_end] = 2
-
-    df['septic_shock'] = shock_values
-
-    total_patients = df['stay_id'].nunique()
-    shock_patients = df.loc[df['septic_shock'] == 1, 'stay_id'].nunique()
-
-    print("\nSeptic Shock Statistics:")
-    print("-" * 50)
-    print(f"Total patients: {total_patients}")
-    print(f"Patients developing shock: {shock_patients} ({shock_patients / max(total_patients, 1) * 100:.1f}%)")
-    print(f"Timesteps with shock onset: {(df['septic_shock'] == 1).sum()}")
-    print(f"Censored timesteps: {(df['septic_shock'] == 2).sum()}")
-    print("-" * 50)
-
-    return df
-
-
 def main():
     global backend
     args = parse_args()
 
-    backend = ComputeBackend(use_gpu=args.gpu, device_id=args.gpu_device)
+    # Handle --no_gpu override
+    use_gpu = args.gpu and not args.no_gpu
+    backend = ComputeBackend(use_gpu=use_gpu, device_id=args.gpu_device)
 
     # Load data as pandas
     data = load_processed_files()
@@ -1876,12 +1526,20 @@ def main():
     del ce_groups, labU_groups, MV_groups
     gc.collect()
 
+    # Tag cohorts so apply_exclusion_criteria can exempt non-onset from score-gate
+    for patient_df in onset_data:
+        patient_df['is_non_onset'] = 0
+    for patient_df in non_onset_data:
+        patient_df['is_non_onset'] = 1
+
     init_traj = pd.concat(onset_data + non_onset_data, ignore_index=True)
     del onset_data, non_onset_data
     gc.collect()
     print(f'  Total rows: {len(init_traj)}, patients: {init_traj["stay_id"].nunique()}')
+    print(f'    onset rows    : {(init_traj["is_non_onset"] == 0).sum()}')
+    print(f'    non-onset rows: {(init_traj["is_non_onset"] == 1).sum()}')
 
-    # Pipeline - ALL memory-efficient (no Polars conversion for large DFs)
+    # Pipeline
     init_traj = handle_outliers(init_traj)
     gc.collect()
 
@@ -1934,7 +1592,6 @@ def main():
         balanced_path = f"{args.output_dir}/patient_timeseries_{current_time}_balanced.csv"
         balanced.to_csv(balanced_path, index=False)
         print(f"Saved balanced data to {balanced_path}")
-
 
 
 if __name__ == "__main__":

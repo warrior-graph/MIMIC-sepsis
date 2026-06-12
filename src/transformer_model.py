@@ -3,7 +3,14 @@ import torch.nn as nn
 import math
 import numpy as np
 from torch.utils.data import DataLoader, TensorDataset
+from torch.amp import autocast, GradScaler
 from typing import Dict, Tuple, Optional, List, Union
+
+# ── GPU-aware defaults ────────────────────────────────────────────────────────
+_CUDA = torch.cuda.is_available()
+_PIN_MEMORY = _CUDA
+_NUM_WORKERS = 4 if _CUDA else 0
+
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model: int, max_len: int = 5000):
@@ -29,7 +36,7 @@ class TimeSeriesTransformer(nn.Module):
                  task_type: str = 'classification'):
         super().__init__()
         self.task_type = task_type
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = torch.device('cuda' if _CUDA else 'cpu')
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.nhead = nhead
@@ -111,7 +118,7 @@ class TimeSeriesTransformer(nn.Module):
             learning_rate: float = 0.001,
             validation_data: Optional[Tuple[np.ndarray, np.ndarray]] = None):
         """
-        Train the Transformer model
+        Train the Transformer model with AMP (Automatic Mixed Precision) on GPU.
         
         Args:
             X: Input features of shape (n_samples, n_timesteps, n_features)
@@ -133,9 +140,16 @@ class TimeSeriesTransformer(nn.Module):
         X_tensor = torch.FloatTensor(X)
         y_tensor = torch.FloatTensor(y)
         
-        # Create dataset and dataloader
+        # Create dataset and dataloader with GPU-optimized settings
         dataset = TensorDataset(X_tensor, y_tensor)
-        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            pin_memory=_PIN_MEMORY,
+            num_workers=_NUM_WORKERS,
+            persistent_workers=(_NUM_WORKERS > 0),
+        )
         
         # Prepare validation data if provided
         val_dataloader = None
@@ -145,11 +159,21 @@ class TimeSeriesTransformer(nn.Module):
                 torch.FloatTensor(X_val),
                 torch.FloatTensor(y_val)
             )
-            val_dataloader = DataLoader(val_dataset, batch_size=batch_size)
+            val_dataloader = DataLoader(
+                val_dataset,
+                batch_size=batch_size,
+                pin_memory=_PIN_MEMORY,
+                num_workers=_NUM_WORKERS,
+                persistent_workers=(_NUM_WORKERS > 0),
+            )
         
         # Initialize optimizer and loss function
         optimizer = torch.optim.Adam(self.parameters(), lr=learning_rate)
         criterion = nn.BCELoss() if self.task_type == 'classification' else nn.MSELoss()
+
+        # AMP GradScaler for mixed-precision training (only effective on CUDA)
+        use_amp = _CUDA
+        scaler = GradScaler('cuda', enabled=use_amp)
         
         # Training loop
         self.train()
@@ -157,17 +181,20 @@ class TimeSeriesTransformer(nn.Module):
             total_loss = 0
             
             for batch_X, batch_y in dataloader:
-                batch_X = batch_X.to(self.device)
-                batch_y = batch_y.to(self.device)
+                batch_X = batch_X.to(self.device, non_blocking=True)
+                batch_y = batch_y.to(self.device, non_blocking=True)
                 
-                # Forward pass
-                outputs = self(batch_X)
-                loss = criterion(outputs, batch_y)
-                
-                # Backward pass and optimization
                 optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+
+                # Forward pass with AMP autocast
+                with autocast('cuda', enabled=use_amp):
+                    outputs = self(batch_X)
+                    loss = criterion(outputs, batch_y)
+                
+                # Backward pass with scaled gradients
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
                 
                 total_loss += loss.item()
             
@@ -185,11 +212,12 @@ class TimeSeriesTransformer(nn.Module):
         
         with torch.no_grad():
             for batch_X, batch_y in val_dataloader:
-                batch_X = batch_X.to(self.device)
-                batch_y = batch_y.to(self.device)
+                batch_X = batch_X.to(self.device, non_blocking=True)
+                batch_y = batch_y.to(self.device, non_blocking=True)
                 
-                outputs = self(batch_X)
-                loss = criterion(outputs, batch_y)
+                with autocast('cuda', enabled=_CUDA):
+                    outputs = self(batch_X)
+                    loss = criterion(outputs, batch_y)
                 total_val_loss += loss.item()
         
         self.train()
@@ -212,20 +240,29 @@ class TimeSeriesTransformer(nn.Module):
         # Convert input to PyTorch tensor
         X_tensor = torch.FloatTensor(X)
         dataset = TensorDataset(X_tensor)
-        dataloader = DataLoader(dataset, batch_size=batch_size)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            pin_memory=_PIN_MEMORY,
+            num_workers=_NUM_WORKERS,
+            persistent_workers=(_NUM_WORKERS > 0),
+        )
         
         predictions = []
         with torch.no_grad():
             for batch_X, in dataloader:
-                batch_X = batch_X.to(self.device)
-                outputs = self(batch_X)
+                batch_X = batch_X.to(self.device, non_blocking=True)
+
+                # Use AMP autocast for inference too
+                with autocast('cuda', enabled=_CUDA):
+                    outputs = self(batch_X)
                 
                 # Ensure outputs are properly shaped before converting to numpy
                 if outputs.ndim == 0:
                     outputs = outputs.unsqueeze(0)
                     
                 # Convert to numpy and append to predictions
-                batch_preds = outputs.cpu().numpy()
+                batch_preds = outputs.float().cpu().numpy()
                 
                 # Ensure batch_preds is always at least 1D
                 if batch_preds.ndim == 0:
@@ -237,4 +274,4 @@ class TimeSeriesTransformer(nn.Module):
         if predictions:
             return np.concatenate(predictions)
         else:
-            return np.array([]) 
+            return np.array([])

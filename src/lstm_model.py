@@ -1,8 +1,15 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
+from torch.amp import autocast, GradScaler
 import numpy as np
 from typing import Dict, Tuple
+
+# ── GPU-aware defaults ────────────────────────────────────────────────────────
+_CUDA = torch.cuda.is_available()
+_PIN_MEMORY = _CUDA
+_NUM_WORKERS = 4 if _CUDA else 0
+
 
 class LSTMModel(nn.Module):
     def __init__(self,
@@ -31,7 +38,7 @@ class LSTMModel(nn.Module):
         super().__init__()
         self.task_type = task_type
         self.output_dim = output_dim
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = torch.device('cuda' if _CUDA else 'cpu')
         
         # LSTM for processing input sequence
         self.lstm = nn.LSTM(
@@ -70,7 +77,7 @@ class LSTMModel(nn.Module):
     
     def fit(self, X: np.ndarray, y: np.ndarray, batch_size: int = 32, epochs: int = 10,
             learning_rate: float = 0.001, random_state: int = None):
-        """Train the LSTM model.
+        """Train the LSTM model with Automatic Mixed Precision (AMP) on GPU.
 
         Parameters
         ----------
@@ -83,7 +90,7 @@ class LSTMModel(nn.Module):
         if random_state is not None:
             torch.manual_seed(random_state)
             np.random.seed(random_state)
-            if torch.cuda.is_available():
+            if _CUDA:
                 torch.cuda.manual_seed(random_state)
                 torch.cuda.manual_seed_all(random_state)
                 torch.backends.cudnn.deterministic = True
@@ -93,31 +100,45 @@ class LSTMModel(nn.Module):
         X_tensor = torch.FloatTensor(X)
         y_tensor = torch.FloatTensor(y)
         
-        # Create dataset and dataloader
+        # Create dataset and dataloader with GPU-optimized settings
         dataset = TensorDataset(X_tensor, y_tensor)
-        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            pin_memory=_PIN_MEMORY,
+            num_workers=_NUM_WORKERS,
+            persistent_workers=(_NUM_WORKERS > 0),
+        )
         
         # Initialize optimizer and loss function
         optimizer = torch.optim.Adam(self.parameters(), lr=learning_rate)
         # Multi-step regression uses MSELoss over (N, H); classification uses BCE over (N,)
         criterion = nn.BCELoss() if self.task_type == 'classification' else nn.MSELoss()
+
+        # AMP GradScaler for mixed-precision training (only effective on CUDA)
+        use_amp = _CUDA
+        scaler = GradScaler('cuda', enabled=use_amp)
         
         # Training loop
         self.train()
         for epoch in range(epochs):
             total_loss = 0
             for batch_X, batch_y in dataloader:
-                batch_X = batch_X.to(self.device)
-                batch_y = batch_y.to(self.device)
+                batch_X = batch_X.to(self.device, non_blocking=True)
+                batch_y = batch_y.to(self.device, non_blocking=True)
                 
-                # Forward pass
-                outputs = self(batch_X)
-                loss = criterion(outputs, batch_y)
-                
-                # Backward pass and optimization
                 optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+
+                # Forward pass with AMP autocast
+                with autocast('cuda', enabled=use_amp):
+                    outputs = self(batch_X)
+                    loss = criterion(outputs, batch_y)
+                
+                # Backward pass with scaled gradients
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
                 
                 total_loss += loss.item()
             
@@ -132,13 +153,22 @@ class LSTMModel(nn.Module):
         # Convert input to PyTorch tensor
         X_tensor = torch.FloatTensor(X)
         dataset = TensorDataset(X_tensor)
-        dataloader = DataLoader(dataset, batch_size=batch_size)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            pin_memory=_PIN_MEMORY,
+            num_workers=_NUM_WORKERS,
+            persistent_workers=(_NUM_WORKERS > 0),
+        )
         
         predictions = []
         with torch.no_grad():
             for batch_X, in dataloader:
-                batch_X = batch_X.to(self.device)
-                outputs = self(batch_X)
+                batch_X = batch_X.to(self.device, non_blocking=True)
+
+                # Use AMP autocast for inference too (saves memory, faster)
+                with autocast('cuda', enabled=_CUDA):
+                    outputs = self(batch_X)
                 
                 # Ensure outputs are properly shaped before converting to numpy
                 # If we have a single sample, make sure it's still a 1D array
@@ -146,7 +176,7 @@ class LSTMModel(nn.Module):
                     outputs = outputs.unsqueeze(0)
                     
                 # Convert to numpy and append to predictions
-                batch_preds = outputs.cpu().numpy()
+                batch_preds = outputs.float().cpu().numpy()
                 
                 # Ensure batch_preds is always at least 1D
                 if batch_preds.ndim == 0:
@@ -158,4 +188,4 @@ class LSTMModel(nn.Module):
         if predictions:
             return np.concatenate(predictions)
         else:
-            return np.array([]) 
+            return np.array([])

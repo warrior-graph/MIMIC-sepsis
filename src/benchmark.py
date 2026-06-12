@@ -18,6 +18,22 @@ import os
 import random
 import torch
 
+# ── GPU auto-detection ────────────────────────────────────────────────────────
+_CUDA_AVAILABLE = torch.cuda.is_available()
+_DEFAULT_BATCH_SIZE = 128 if _CUDA_AVAILABLE else 32
+
+
+def _log_gpu_info():
+    """Print GPU device information at startup."""
+    if _CUDA_AVAILABLE:
+        dev_name = torch.cuda.get_device_name(0)
+        dev_mem = torch.cuda.get_device_properties(0).total_mem / 1024**3
+        print(f"[GPU] {dev_name} — {dev_mem:.1f} GB VRAM")
+        print(f"[GPU] Default batch size auto-set to {_DEFAULT_BATCH_SIZE}")
+    else:
+        print("[GPU] No CUDA device detected — running on CPU")
+        print(f"[GPU] Default batch size: {_DEFAULT_BATCH_SIZE}")
+
 
 # Set random seeds at the top of your file
 def set_random_seeds(seed=42):
@@ -32,6 +48,11 @@ def set_random_seeds(seed=42):
     os.environ['TF_DETERMINISTIC_OPS'] = '1'
     # Set NumPy print options for consistent output
     np.set_printoptions(precision=3, suppress=True)
+
+    # cuDNN: allow auto-tuning for speed (deterministic=True ensures reproducibility)
+    if _CUDA_AVAILABLE:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = True  # auto-tune kernels for input size
     
     print(f"Random seeds set to {seed} for reproducibility")
 
@@ -387,8 +408,8 @@ def run_benchmark(task: str, model_type: str, include_treatments: bool = True,
 
     # ── Single-step path (all existing models) ────────────────────────────────
 
-    # Configure batch size based on model type
-    batch_size = 32 if model_type in ['lstm', 'transformer'] else None
+    # Configure batch size based on model type — auto-scale for GPU
+    batch_size = _DEFAULT_BATCH_SIZE if model_type in ['lstm', 'transformer'] else None
     
     # Train model
     print(f"\nTraining {model_type} model...")
@@ -640,11 +661,15 @@ def run_selected_experiments(task: str, include_treatments: bool = False,
     return results
 
 if __name__ == "__main__":
-    # Set random seeds at the beginning
+    # Log GPU info and set seeds
+    _log_gpu_info()
     set_random_seeds()
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--random_state", type=int, default=42, help="Random seed")
+    parser.add_argument("--device", type=str, default="auto",
+                        choices=["auto", "cpu", "cuda"],
+                        help="Compute device: auto (default), cpu, or cuda")
     parser.add_argument("--run_all", action="store_true", help="Run all experiments")
     parser.add_argument("--run_selected", action="store_true", help="Run all models for a specific task")
     parser.add_argument("--task", type=str, default="mechvent", help="Target column name")
