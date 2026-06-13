@@ -239,6 +239,34 @@ python src/benchmark.py --task septic_shock --model_type lstm \
     --data_path processed_files/patient_timeseries_2026-06-11-12-30-00_balanced.csv
 ```
 
+**With treatment variables included:**
+```bash
+python src/benchmark.py --task vasopressor --model_type transformer \
+    --include_treatments True --prediction_horizon 6
+```
+
+**Gradient boosting models:**
+```bash
+python src/benchmark.py --task morta_hosp --model_type xgboost
+python src/benchmark.py --task morta_hosp --model_type lightgbm \
+    --gbm_n_estimators 500 --gbm_max_depth 8 --gbm_learning_rate 0.03
+```
+
+**Multi-step score forecasting (Prophet / TFT / LSTM-multistep):**
+```bash
+# Prophet — statistical per-patient time series model
+python src/benchmark.py --task sofa_score --model_type prophet \
+    --prediction_horizon 6
+
+# Temporal Fusion Transformer
+python src/benchmark.py --task sofa_score --model_type tft \
+    --prediction_horizon 6 --tft_max_epochs 30 --tft_hidden_size 32
+
+# LSTM with multi-step output head
+python src/benchmark.py --task sofa_score --model_type lstm_multistep \
+    --prediction_horizon 6
+```
+
 **Run all experiments:**
 ```bash
 python src/benchmark.py --run_all
@@ -249,41 +277,74 @@ python src/benchmark.py --run_all
 python src/benchmark.py --run_selected --task news2_score
 ```
 
+**Tag a run and save results to a custom file:**
+```bash
+python src/benchmark.py --task septic_shock --model_type lstm \
+    --run_tag "exp-v1-no-treatments" \
+    --output_csv results/my_experiment.csv
+```
+
 **All Stage 4 arguments:**
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--task` | `mechvent` | Prediction target (see table below) |
-| `--model_type` | `lstm` | `linear` / `lstm` / `transformer` |
-| `--prediction_horizon` | `6` | Timesteps ahead to predict (temporal tasks) |
-| `--include_treatments` | `False` | Include treatment variables as features |
+| `--task` | `mechvent` | Prediction target (see task table below) |
+| `--model_type` | `lstm` | Model to train (see model table below) |
+| `--prediction_horizon` | `6` | Timesteps ahead to predict (temporal tasks only) |
+| `--include_treatments` | `False` | Include treatment variables (vasopressor, fluids, mechvent) as features |
 | `--balance` | off | Apply window-level balancing before training |
 | `--balance_strategy` | `undersample` | `undersample` / `oversample` / `combined` |
 | `--data_path` | `processed_files/patient_timeseries_v4.csv` | Input CSV path |
-| `--regularization` | `ridge` | Linear model regularization (`ridge` / `lasso` / `elasticnet` / `none`) |
-| `--alpha` | `1.0` | Regularization strength |
-
-The benchmark script trains and evaluates three model architectures across seven prediction tasks:
+| `--regularization` | `ridge` | Linear model regularization: `ridge` / `lasso` / `elasticnet` / `none` |
+| `--alpha` | `1.0` | Regularization strength for linear models |
+| `--sofa_threshold` | `2` | SOFA exceedance threshold (Sepsis-3 criterion) |
+| `--sirs_threshold` | `2` | SIRS exceedance threshold |
+| `--news2_threshold` | `5` | NEWS2 exceedance threshold (medium clinical risk) |
+| `--decision_threshold` | `0.5` | Probability cut-off for hard binary predictions (affects Accuracy; AUROC/AUPRC are unaffected) |
+| `--gbm_n_estimators` | `300` | [xgboost/lightgbm] Number of boosting rounds |
+| `--gbm_max_depth` | `6` | [xgboost/lightgbm] Max tree depth (`-1` = unlimited for LightGBM) |
+| `--gbm_learning_rate` | `0.05` | [xgboost/lightgbm] Learning rate / shrinkage |
+| `--gbm_subsample` | `0.8` | [xgboost/lightgbm] Row sub-sampling ratio |
+| `--gbm_colsample` | `0.8` | [xgboost/lightgbm] Column sub-sampling per tree |
+| `--gbm_early_stopping` | off | [xgboost/lightgbm] Early stopping rounds |
+| `--tft_max_epochs` | `30` | [tft] Max training epochs |
+| `--tft_hidden_size` | `32` | [tft] Hidden layer size |
+| `--tft_attention_heads` | `4` | [tft] Number of attention heads |
+| `--tft_dropout` | `0.1` | [tft] Dropout rate |
+| `--tft_batch_size` | `64` | [tft] Batch size |
+| `--output_csv` | `results/score_benchmark.csv` | CSV file to append results to (created if missing) |
+| `--run_tag` | `""` | Free-form label added as a `run_tag` column for tracking experiment variants |
+| `--random_state` | `42` | Random seed for reproducibility |
 
 **Models:**
-| Model | Description |
-|-------|-------------|
-| Linear | Logistic/Ridge regression (flattened temporal features) |
-| LSTM | 2-layer LSTM with dropout (hidden dim=64) |
-| Transformer | Multi-head attention encoder (8 heads, 2 layers) |
+
+| `--model_type` | Description |
+|----------------|-------------|
+| `linear` | Logistic/Ridge regression on flattened temporal features |
+| `lstm` | 2-layer LSTM with dropout (hidden dim=64) |
+| `lstm_multistep` | LSTM with multi-step output head (outputs `prediction_horizon` steps) |
+| `transformer` | Multi-head attention encoder (8 heads, 2 layers, hidden dim=64) |
+| `xgboost` | XGBoost gradient boosting (flattened features) |
+| `lightgbm` | LightGBM gradient boosting (flattened features) |
+| `prophet` | Per-patient statistical time-series model; multi-step score forecasting only |
+| `tft` | Temporal Fusion Transformer via pytorch-forecasting; multi-step score forecasting only |
+
+> `prophet` and `tft` only support multi-step score forecasting tasks (`sofa_score`, `sirs_score`, `news2_score`).
 
 **Prediction Tasks:**
-| Task | Type | Approach |
-|------|------|----------|
-| In-Hospital Mortality (`morta_hosp`) | Binary classification | First 6 timesteps |
-| Length of Stay (`los`) | Regression | First 6 timesteps |
-| Septic Shock (`septic_shock`) | Binary classification | Rolling window → predict next N steps |
-| Vasopressor Requirement (`vasopressor`) | Binary classification | Rolling window → predict next N steps |
-| SOFA Score (`sofa_score`) | Regression | Rolling window → mean future SOFA |
-| SIRS Score (`sirs_score`) | Regression | Rolling window → mean future SIRS |
-| NEWS2 Score (`news2_score`) | Regression | Rolling window → mean future NEWS2 |
 
-Data is split 80/20 by patient ID to prevent data leakage.
+| `--task` | Type | Approach |
+|----------|------|----------|
+| `morta_hosp` | Binary classification | First 6 timesteps → in-hospital mortality |
+| `los` | Regression | First 6 timesteps → total length of stay (hours) |
+| `mechvent` | Binary classification | Rolling window → mechanical ventilation within next N steps |
+| `septic_shock` | Binary classification | Rolling window → septic shock onset within next N steps |
+| `vasopressor` | Binary classification | Rolling window → vasopressor requirement within next N steps |
+| `sofa_score` | Binary classification | Rolling window → SOFA ≥ threshold within next N steps |
+| `sirs_score` | Binary classification | Rolling window → SIRS ≥ threshold within next N steps |
+| `news2_score` | Binary classification | Rolling window → NEWS2 ≥ threshold within next N steps |
+
+Data is split 80/20 by patient ID to prevent data leakage. Results are appended to `--output_csv` with a timestamp and optional `--run_tag` for experiment tracking.
 
 ## Repository Structure
 

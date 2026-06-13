@@ -32,7 +32,7 @@ class TimeSeriesTransformer(nn.Module):
                  hidden_dim: int = 64,
                  num_layers: int = 2,
                  nhead: int = 8,
-                 dropout: float = 0.1,
+                 dropout: float = 0.2,
                  task_type: str = 'classification'):
         super().__init__()
         self.task_type = task_type
@@ -112,35 +112,38 @@ class TimeSeriesTransformer(nn.Module):
         
         return x.squeeze()
     
-    def fit(self, X: np.ndarray, y: np.ndarray, 
-            batch_size: int = 32, 
-            epochs: int = 10, 
+    def fit(self, X: np.ndarray, y: np.ndarray,
+            batch_size: int = 32,
+            epochs: int = 30,
             learning_rate: float = 0.001,
+            weight_decay: float = 1e-4,
+            patience: int = 5,
+            grad_clip: float = 1.0,
             validation_data: Optional[Tuple[np.ndarray, np.ndarray]] = None):
-        """
-        Train the Transformer model with AMP (Automatic Mixed Precision) on GPU.
-        
+        """Train the Transformer model with AMP, early stopping, weight decay, and LR scheduling.
+
         Args:
             X: Input features of shape (n_samples, n_timesteps, n_features)
             y: Target values of shape (n_samples,)
             batch_size: Batch size for training
-            epochs: Number of training epochs
-            learning_rate: Learning rate for optimizer
-            validation_data: Optional tuple of (X_val, y_val) for validation
+            epochs: Maximum training epochs
+            learning_rate: Initial learning rate for Adam
+            weight_decay: L2 regularization coefficient
+            patience: Early stopping patience (epochs without val loss improvement)
+            grad_clip: Max gradient norm (0 disables clipping)
+            validation_data: Optional (X_val, y_val) — enables early stopping and LR scheduling
         """
         # Initialize model if not already done
         if not self.initialized:
-            self.input_dim = X.shape[2]  # Get input dimension from data
+            self.input_dim = X.shape[2]
             self._initialize_model(self.input_dim)
             self.initialized = True
-        
+
         self.to(self.device)
-        
-        # Convert input data to PyTorch tensors
+
         X_tensor = torch.FloatTensor(X)
         y_tensor = torch.FloatTensor(y)
-        
-        # Create dataset and dataloader with GPU-optimized settings
+
         dataset = TensorDataset(X_tensor, y_tensor)
         dataloader = DataLoader(
             dataset,
@@ -150,8 +153,7 @@ class TimeSeriesTransformer(nn.Module):
             num_workers=_NUM_WORKERS,
             persistent_workers=(_NUM_WORKERS > 0),
         )
-        
-        # Prepare validation data if provided
+
         val_dataloader = None
         if validation_data is not None:
             X_val, y_val = validation_data
@@ -166,44 +168,62 @@ class TimeSeriesTransformer(nn.Module):
                 num_workers=_NUM_WORKERS,
                 persistent_workers=(_NUM_WORKERS > 0),
             )
-        
-        # Initialize optimizer and loss function
-        optimizer = torch.optim.Adam(self.parameters(), lr=learning_rate)
-        criterion = nn.BCELoss() if self.task_type == 'classification' else nn.MSELoss()
 
-        # AMP GradScaler for mixed-precision training (only effective on CUDA)
+        optimizer = torch.optim.Adam(self.parameters(), lr=learning_rate, weight_decay=weight_decay)
+        criterion = nn.BCELoss() if self.task_type == 'classification' else nn.MSELoss()
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', patience=3, factor=0.5
+        )
+
         use_amp = _CUDA
         scaler = GradScaler('cuda', enabled=use_amp)
-        
-        # Training loop
+
+        best_val_loss = float('inf')
+        patience_counter = 0
+        best_state = None
+
         self.train()
         for epoch in range(epochs):
-            total_loss = 0
-            
+            total_loss = 0.0
+
             for batch_X, batch_y in dataloader:
                 batch_X = batch_X.to(self.device, non_blocking=True)
                 batch_y = batch_y.to(self.device, non_blocking=True)
-                
+
                 optimizer.zero_grad()
 
-                # Forward pass with AMP autocast
                 with autocast('cuda', enabled=use_amp):
                     outputs = self(batch_X)
                     loss = criterion(outputs, batch_y)
-                
-                # Backward pass with scaled gradients
+
                 scaler.scale(loss).backward()
+                if grad_clip > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=grad_clip)
                 scaler.step(optimizer)
                 scaler.update()
-                
+
                 total_loss += loss.item()
-            
-            # Validation if data provided
+
+            train_loss = total_loss / len(dataloader)
+
             if val_dataloader is not None:
                 val_loss = self._validate(val_dataloader, criterion)
-                print(f'Epoch [{epoch+1}/{epochs}], Loss: {total_loss/len(dataloader):.4f}, Val Loss: {val_loss:.4f}')
+                scheduler.step(val_loss)
+                print(f'Epoch [{epoch+1}/{epochs}], Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
+
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    best_state = {k: v.clone() for k, v in self.state_dict().items()}
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                    if patience_counter >= patience:
+                        print(f'Early stopping at epoch {epoch+1} (patience={patience})')
+                        self.load_state_dict(best_state)
+                        break
             elif (epoch + 1) % 5 == 0:
-                print(f'Epoch [{epoch+1}/{epochs}], Loss: {total_loss/len(dataloader):.4f}')
+                print(f'Epoch [{epoch+1}/{epochs}], Loss: {train_loss:.4f}')
     
     def _validate(self, val_dataloader, criterion):
         """Run validation and return validation loss"""

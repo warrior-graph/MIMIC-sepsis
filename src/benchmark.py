@@ -27,7 +27,7 @@ def _log_gpu_info():
     """Print GPU device information at startup."""
     if _CUDA_AVAILABLE:
         dev_name = torch.cuda.get_device_name(0)
-        dev_mem = torch.cuda.get_device_properties(0).total_mem / 1024**3
+        dev_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3
         print(f"[GPU] {dev_name} — {dev_mem:.1f} GB VRAM")
         print(f"[GPU] Default batch size auto-set to {_DEFAULT_BATCH_SIZE}")
     else:
@@ -266,6 +266,14 @@ def run_benchmark(task: str, model_type: str, include_treatments: bool = True,
                  # Score threshold-exceedance parameters
                  score_thresholds: dict = None,
                  decision_threshold: float = 0.5,
+                 # Window stride
+                 window_stride: int = 2,
+                 # LSTM / Transformer regularization
+                 dropout: float = 0.2,
+                 weight_decay: float = 1e-4,
+                 patience: int = 5,
+                 grad_clip: float = 1.0,
+                 epochs: int = 30,
                  # XGBoost / LightGBM hyperparameters
                  gbm_n_estimators: int = 300,
                  gbm_max_depth: int = 6,
@@ -273,6 +281,9 @@ def run_benchmark(task: str, model_type: str, include_treatments: bool = True,
                  gbm_subsample: float = 0.8,
                  gbm_colsample: float = 0.8,
                  gbm_early_stopping: int = None,
+                 gbm_reg_alpha: float = 0.0,
+                 gbm_reg_lambda: float = 1.0,
+                 gbm_min_child_weight: int = 1,
                  # LSTM multi-step
                  lstm_output_dim: int = 1,
                  # TFT hyperparameters
@@ -306,6 +317,7 @@ def run_benchmark(task: str, model_type: str, include_treatments: bool = True,
         task=task,
         window_size=6,
         prediction_horizon=prediction_horizon if task in TEMPORAL_TASKS else None,
+        stride=window_stride,
         balance=balance,
         balance_strategy=balance_strategy,
         random_state=random_state,
@@ -382,8 +394,17 @@ def run_benchmark(task: str, model_type: str, include_treatments: bool = True,
                 task_type='regression',
                 input_dim=input_dim,
                 output_dim=H,
+                dropout=dropout,
             )
-            model.fit(train_features_ms_norm, train_targets_ms, batch_size=32)
+            model.fit(
+                train_features_ms_norm, train_targets_ms,
+                batch_size=_DEFAULT_BATCH_SIZE,
+                epochs=epochs,
+                weight_decay=weight_decay,
+                patience=patience,
+                grad_clip=grad_clip,
+                val_data=(val_features_ms_norm, val_targets_ms),
+            )
             train_preds = model.predict(train_features_ms_norm, batch_size=32)
             val_preds   = model.predict(val_features_ms_norm,   batch_size=32)
 
@@ -435,9 +456,9 @@ def run_benchmark(task: str, model_type: str, include_treatments: bool = True,
         )
     elif model_type == 'lstm':
         input_dim = train_features_norm.shape[2]
-        model = LSTMModel(task_type=task_type, input_dim=input_dim, output_dim=1)
+        model = LSTMModel(task_type=task_type, input_dim=input_dim, output_dim=1, dropout=dropout)
     elif model_type == 'transformer':
-        model = TimeSeriesTransformer(task_type=task_type)
+        model = TimeSeriesTransformer(task_type=task_type, dropout=dropout)
     elif model_type == 'xgboost':
         model = XGBoostModel(
             task_type=task_type,
@@ -446,6 +467,9 @@ def run_benchmark(task: str, model_type: str, include_treatments: bool = True,
             learning_rate=gbm_learning_rate,
             subsample=gbm_subsample,
             colsample_bytree=gbm_colsample,
+            reg_alpha=gbm_reg_alpha,
+            reg_lambda=gbm_reg_lambda,
+            min_child_weight=gbm_min_child_weight,
             random_state=random_state,
             early_stopping_rounds=gbm_early_stopping,
         )
@@ -457,6 +481,9 @@ def run_benchmark(task: str, model_type: str, include_treatments: bool = True,
             learning_rate=gbm_learning_rate,
             subsample=gbm_subsample,
             colsample_bytree=gbm_colsample,
+            reg_alpha=gbm_reg_alpha,
+            reg_lambda=gbm_reg_lambda,
+            min_child_samples=gbm_min_child_weight,
             random_state=random_state,
             early_stopping_rounds=gbm_early_stopping,
         )
@@ -466,12 +493,31 @@ def run_benchmark(task: str, model_type: str, include_treatments: bool = True,
                          f"xgboost, lightgbm, prophet, tft")
     
     if batch_size:
-        # For LSTM and Transformer models, use batched training
-        model.fit(train_features_norm, train_targets, batch_size=batch_size)
+        # LSTM and Transformer — pass val_data for early stopping and LR scheduling
+        if model_type == 'lstm':
+            model.fit(
+                train_features_norm, train_targets,
+                batch_size=batch_size,
+                epochs=epochs,
+                weight_decay=weight_decay,
+                patience=patience,
+                grad_clip=grad_clip,
+                val_data=(val_features_norm, val_targets),
+            )
+        else:  # transformer
+            model.fit(
+                train_features_norm, train_targets,
+                batch_size=batch_size,
+                epochs=epochs,
+                weight_decay=weight_decay,
+                patience=patience,
+                grad_clip=grad_clip,
+                validation_data=(val_features_norm, val_targets),
+            )
         train_preds = model.predict(train_features_norm, batch_size=batch_size)
         val_preds = model.predict(val_features_norm, batch_size=batch_size)
-    elif model_type in ('xgboost', 'lightgbm') and gbm_early_stopping is not None:
-        # Pass validation set for early stopping
+    elif model_type in ('xgboost', 'lightgbm'):
+        # Always pass eval_set; early stopping activates only when gbm_early_stopping is set
         model.fit(
             train_features_norm, train_targets,
             eval_set=[(val_features_norm, val_targets)],
@@ -479,7 +525,7 @@ def run_benchmark(task: str, model_type: str, include_treatments: bool = True,
         train_preds = model.predict(train_features_norm)
         val_preds = model.predict(val_features_norm)
     else:
-        # Linear, XGBoost (no early stopping), LightGBM (no early stopping)
+        # Linear
         model.fit(train_features_norm, train_targets)
         train_preds = model.predict(train_features_norm)
         val_preds = model.predict(val_features_norm)
@@ -672,7 +718,8 @@ if __name__ == "__main__":
                         help="Compute device: auto (default), cpu, or cuda")
     parser.add_argument("--run_all", action="store_true", help="Run all experiments")
     parser.add_argument("--run_selected", action="store_true", help="Run all models for a specific task")
-    parser.add_argument("--task", type=str, default="mechvent", help="Target column name")
+    parser.add_argument("--task", type=str, nargs="+", default=["mechvent"],
+                        help="One or more task names (e.g. --task sofa_score sirs_score news2_score)")
     parser.add_argument("--model_type", type=str, default="lstm",
                         choices=["linear", "lstm", "lstm_multistep", "transformer",
                                  "xgboost", "lightgbm", "prophet", "tft"],
@@ -704,6 +751,21 @@ if __name__ == "__main__":
                         help="Probability cut-off for hard binary prediction (default: 0.5). "
                              "Only used for classification tasks. Affects Accuracy; "
                              "AUROC and AUPRC are threshold-free.")
+    # ── Window stride ────────────────────────────────────────────────────────
+    parser.add_argument("--window_stride", type=int, default=2,
+                        help="Step size between consecutive sliding windows (default: 2). "
+                             "stride=1 restores original behaviour (max overlap).")
+    # ── LSTM / Transformer regularization ───────────────────────────────────
+    parser.add_argument("--dropout", type=float, default=0.2,
+                        help="[lstm/transformer] Dropout rate (default: 0.2)")
+    parser.add_argument("--weight_decay", type=float, default=1e-4,
+                        help="[lstm/transformer] Adam weight decay / L2 regularization (default: 1e-4)")
+    parser.add_argument("--patience", type=int, default=5,
+                        help="[lstm/transformer] Early stopping patience in epochs (default: 5)")
+    parser.add_argument("--grad_clip", type=float, default=1.0,
+                        help="[lstm/transformer] Gradient clipping max norm (0 disables, default: 1.0)")
+    parser.add_argument("--epochs", type=int, default=30,
+                        help="[lstm/transformer] Max training epochs (default: 30)")
     # ── XGBoost / LightGBM hyperparameters ──────────────────────────────────
     parser.add_argument("--gbm_n_estimators", type=int, default=300,
                         help="[xgboost/lightgbm] Number of boosting rounds (default: 300)")
@@ -717,6 +779,12 @@ if __name__ == "__main__":
                         help="[xgboost/lightgbm] Column sub-sampling ratio per tree (default: 0.8)")
     parser.add_argument("--gbm_early_stopping", type=int, default=None,
                         help="[xgboost/lightgbm] Early stopping rounds (default: disabled)")
+    parser.add_argument("--gbm_reg_alpha", type=float, default=0.0,
+                        help="[xgboost/lightgbm] L1 regularization (default: 0.0)")
+    parser.add_argument("--gbm_reg_lambda", type=float, default=1.0,
+                        help="[xgboost/lightgbm] L2 regularization (default: 1.0)")
+    parser.add_argument("--gbm_min_child_weight", type=int, default=1,
+                        help="[xgboost/lightgbm] Min samples per leaf / min_child_weight (default: 1)")
     # ── TFT / LSTM-multistep hyperparameters ────────────────────────────────
     parser.add_argument("--tft_max_epochs", type=int, default=30,
                         help="[tft] Max training epochs (default: 30)")
@@ -753,44 +821,54 @@ if __name__ == "__main__":
         run_all_experiments()
     elif args.run_selected:
         run_selected_experiments(
-            args.task,
+            args.task[0],
             args.include_treatments,
             score_thresholds=_score_thresholds,
             decision_threshold=args.decision_threshold,
         )
     else:
-        result = run_benchmark(
-            args.task,
-            args.model_type,
-            args.include_treatments,
-            prediction_horizon=args.prediction_horizon if args.task in TEMPORAL_TASKS else None,
-            random_state=args.random_state,
-            regularization=args.regularization,
-            alpha=args.alpha,
-            balance=args.balance,
-            balance_strategy=args.balance_strategy,
-            data_path=args.data_path,
-            score_thresholds=_score_thresholds,
-            decision_threshold=args.decision_threshold,
-            gbm_n_estimators=args.gbm_n_estimators,
-            gbm_max_depth=args.gbm_max_depth,
-            gbm_learning_rate=args.gbm_learning_rate,
-            gbm_subsample=args.gbm_subsample,
-            gbm_colsample=args.gbm_colsample,
-            gbm_early_stopping=args.gbm_early_stopping,
-            lstm_output_dim=args.prediction_horizon if args.model_type == 'lstm_multistep' else 1,
-            tft_max_epochs=args.tft_max_epochs,
-            tft_hidden_size=args.tft_hidden_size,
-            tft_attention_heads=args.tft_attention_heads,
-            tft_dropout=args.tft_dropout,
-            tft_batch_size=args.tft_batch_size,
-        )
-        # Append result to shared CSV with run_tag and timestamp
-        result['run_tag'] = args.run_tag
-        result['timestamp'] = datetime.now().strftime("%Y-%m-%d-%H:%M:%S")
-        out_path = args.output_csv
-        os.makedirs(os.path.dirname(out_path) if os.path.dirname(out_path) else ".", exist_ok=True)
-        row_df = pd.DataFrame([result])
-        write_header = not os.path.exists(out_path)
-        row_df.to_csv(out_path, mode='a', index=False, header=write_header)
-        print(f"Result appended to {out_path}")
+        for task in args.task:
+            result = run_benchmark(
+                task,
+                args.model_type,
+                args.include_treatments,
+                prediction_horizon=args.prediction_horizon if task in TEMPORAL_TASKS else None,
+                random_state=args.random_state,
+                regularization=args.regularization,
+                alpha=args.alpha,
+                balance=args.balance,
+                balance_strategy=args.balance_strategy,
+                data_path=args.data_path,
+                score_thresholds=_score_thresholds,
+                decision_threshold=args.decision_threshold,
+                window_stride=args.window_stride,
+                dropout=args.dropout,
+                weight_decay=args.weight_decay,
+                patience=args.patience,
+                grad_clip=args.grad_clip,
+                epochs=args.epochs,
+                gbm_n_estimators=args.gbm_n_estimators,
+                gbm_max_depth=args.gbm_max_depth,
+                gbm_learning_rate=args.gbm_learning_rate,
+                gbm_subsample=args.gbm_subsample,
+                gbm_colsample=args.gbm_colsample,
+                gbm_early_stopping=args.gbm_early_stopping,
+                gbm_reg_alpha=args.gbm_reg_alpha,
+                gbm_reg_lambda=args.gbm_reg_lambda,
+                gbm_min_child_weight=args.gbm_min_child_weight,
+                lstm_output_dim=args.prediction_horizon if args.model_type == 'lstm_multistep' else 1,
+                tft_max_epochs=args.tft_max_epochs,
+                tft_hidden_size=args.tft_hidden_size,
+                tft_attention_heads=args.tft_attention_heads,
+                tft_dropout=args.tft_dropout,
+                tft_batch_size=args.tft_batch_size,
+            )
+            # Append result to shared CSV with run_tag and timestamp
+            result['run_tag'] = args.run_tag
+            result['timestamp'] = datetime.now().strftime("%Y-%m-%d-%H:%M:%S")
+            out_path = args.output_csv
+            os.makedirs(os.path.dirname(out_path) if os.path.dirname(out_path) else ".", exist_ok=True)
+            row_df = pd.DataFrame([result])
+            write_header = not os.path.exists(out_path)
+            row_df.to_csv(out_path, mode='a', index=False, header=write_header)
+            print(f"[{task}] Result appended to {out_path}")

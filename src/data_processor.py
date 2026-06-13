@@ -149,6 +149,7 @@ class TimeSeriesDataProcessor:
                  task: str,
                  window_size: int = None,
                  prediction_horizon: int = None,
+                 stride: int = 2,
                  balance: bool = False,
                  balance_strategy: str = 'undersample',
                  random_state: int = 42,
@@ -162,6 +163,10 @@ class TimeSeriesDataProcessor:
             'vasopressor', 'sofa_score', 'sirs_score', 'news2_score'
         window_size : int, optional
         prediction_horizon : int, optional
+        stride : int
+            Step size between consecutive sliding windows (default 2).
+            stride=1 gives maximum overlap (original behaviour).
+            stride=2 halves the number of windows and reduces memorization.
         balance : bool
             If True, apply class / strata balancing after window extraction.
         balance_strategy : str
@@ -177,6 +182,7 @@ class TimeSeriesDataProcessor:
         self.task = task
         self.window_size = window_size
         self.prediction_horizon = prediction_horizon
+        self.stride = stride
         self.balance = balance
         self.balance_strategy = balance_strategy
         self.random_state = random_state
@@ -233,11 +239,11 @@ class TimeSeriesDataProcessor:
             group = group.sort_values('timestep')
             
             # Create windows
-            for i in range(len(group) - self.window_size - self.prediction_horizon + 1):
+            for i in range(0, len(group) - self.window_size - self.prediction_horizon + 1, self.stride):
                 window = group.iloc[i:i + self.window_size]
                 if len(window) == self.window_size:
                     features.append(window[self.features].values)
-                    
+
                     # Check if sepsis occurs within prediction horizon
                     future_window = group.iloc[i + self.window_size:
                                              i + self.window_size + self.prediction_horizon]
@@ -319,11 +325,11 @@ class TimeSeriesDataProcessor:
             group = group.sort_values('timestep')
             
             # Create windows
-            for i in range(len(group) - self.window_size - self.prediction_horizon + 1):
+            for i in range(0, len(group) - self.window_size - self.prediction_horizon + 1, self.stride):
                 window = group.iloc[i:i + self.window_size]
                 if len(window) == self.window_size:
                     features.append(window[self.features].values)
-                    
+
                     # Check if mechanical ventilation occurs within prediction horizon
                     future_window = group.iloc[i + self.window_size:
                                              i + self.window_size + self.prediction_horizon]
@@ -353,11 +359,11 @@ class TimeSeriesDataProcessor:
             group = group.sort_values('timestep')
             
             # Create windows
-            for i in range(len(group) - self.window_size - self.prediction_horizon + 1):
+            for i in range(0, len(group) - self.window_size - self.prediction_horizon + 1, self.stride):
                 window = group.iloc[i:i + self.window_size]
                 if len(window) == self.window_size:
                     features.append(window[self.features].values)
-                    
+
                     # Check if septic shock occurs within prediction horizon
                     future_window = group.iloc[i + self.window_size:
                                              i + self.window_size + self.prediction_horizon]
@@ -388,15 +394,15 @@ class TimeSeriesDataProcessor:
             group = group.sort_values('timestep')
             
             # Create windows
-            for i in range(len(group) - self.window_size - self.prediction_horizon + 1):
+            for i in range(0, len(group) - self.window_size - self.prediction_horizon + 1, self.stride):
                 window = group.iloc[i:i + self.window_size]
                 if len(window) == self.window_size:
                     features.append(window[self.features].values)
-                    
+
                     # Check if vasopressor is required within prediction horizon
                     future_window = group.iloc[i + self.window_size:
                                              i + self.window_size + self.prediction_horizon]
-                    
+
                     # Check if either vaso_median or vaso_max is > 0
                     vaso_required = (future_window['vaso_median'].max() > 0) or (future_window['vaso_max'].max() > 0)
                     targets.append(1 if vaso_required else 0)
@@ -445,7 +451,7 @@ class TimeSeriesDataProcessor:
         for _, group in grouped:
             group = group.sort_values('timestep')
 
-            for i in range(len(group) - self.window_size - self.prediction_horizon + 1):
+            for i in range(0, len(group) - self.window_size - self.prediction_horizon + 1, self.stride):
                 window = group.iloc[i:i + self.window_size]
                 if len(window) == self.window_size:
                     features.append(window[self.features].values)
@@ -498,7 +504,7 @@ class TimeSeriesDataProcessor:
         for _, group in grouped:
             group = group.sort_values('timestep')
 
-            for i in range(len(group) - self.window_size - self.prediction_horizon + 1):
+            for i in range(0, len(group) - self.window_size - self.prediction_horizon + 1, self.stride):
                 window = group.iloc[i:i + self.window_size]
                 if len(window) == self.window_size:
                     features.append(window[self.features].values)
